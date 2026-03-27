@@ -1,0 +1,14 @@
+{
+    "merchant_id": "thouseirvine",
+    "store_name": "Thouseirvine (T House)",
+    "website": "https://thouseirvine.com/",
+    "slack_channel": "C0ANTP265MK",
+    "industry": "automotive protection and detailing",
+    "location": "Irvine, CA",
+    "phone": "949-636-6060",
+    "email": "thouseirvine@gmail.com",
+    "brand_color_primary": "#1a1a2e",
+    "brand_color_accent": "#e94560",
+    "blog_style": "premium",
+    "default_post_times": ["09:00", "13:00", "17:00"]
+}
