@@ -1,0 +1,14 @@
+{
+    "merchant_id": "sorensen_hvac",
+    "store_name": "Sorensen Heating and Cooling",
+    "website": "https://sorensenhvac.com/",
+    "slack_channel": "C0APAS5367Q",
+    "industry": "HVAC services",
+    "location": "Surprise, AZ",
+    "phone": "(623) 322-0747",
+    "email": "office@sorensenhvac.com",
+    "brand_color_primary": "#0a1628",
+    "brand_color_accent": "#2196f3",
+    "blog_style": "professional",
+    "default_post_times": ["09:00", "13:00", "17:00"]
+}
