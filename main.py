@@ -33,6 +33,7 @@ from slack_ui.blocks import (
     build_batch_summary_blocks,
     build_schedule_status_blocks,
     build_generating_message,
+    build_progress_blocks,
 )
 from store.blog_store import get_drafts
 
@@ -58,7 +59,7 @@ _bot_user_id: str = ""
 
 @app.event("message")
 def handle_message(event: dict, say, client) -> None:
-    """处理频道中的消息 — 识别 auto 指令"""
+    """处理频道中的消息 — 只响应 @mention 的 auto 指令"""
     # 过滤 Bot 自身消息
     user = event.get("user", "")
     if user == _bot_user_id:
@@ -71,10 +72,26 @@ def handle_message(event: dict, say, client) -> None:
     text = event.get("text", "").strip()
     channel = event.get("channel", "")
 
+    # 必须 @mention Bot 才响应
+    if f"<@{_bot_user_id}>" not in text:
+        return
+
+    # 去掉 @mention 部分，提取纯指令文本
+    text = text.replace(f"<@{_bot_user_id}>", "").strip()
+
     # 检查是否是 auto 指令
     cmd = parse_auto_command(text)
     if cmd is None:
-        return  # 不是 auto 指令，忽略
+        # @mention 了但不是 auto 指令 → 显示帮助
+        say(
+            ":wave: Hi! Here's how to use me:\n\n"
+            f"• `@bot auto 3` — Generate 3 blog posts now\n"
+            f"• `@bot auto on` — Start daily scheduled generation\n"
+            f"• `@bot auto on 09:00 14:00` — Schedule at custom times\n"
+            f"• `@bot auto off` — Stop scheduled generation\n"
+            f"• `@bot auto status` — Check schedule & recent posts"
+        )
+        return
 
     # 查找频道对应的商家
     merchant_cfg = get_merchant_by_channel(channel)
@@ -92,17 +109,53 @@ def handle_message(event: dict, say, client) -> None:
     if cmd.action == "generate":
         count = cmd.count
 
-        # 发送 "正在生成" 提示
-        say(
+        # 发送初始进度消息（后续会 chat_update 更新这条消息）
+        init_resp = client.chat_postMessage(
+            channel=channel,
             text=f"Generating {count} blog post(s) for {store_name}...",
             blocks=build_generating_message(store_name, count),
         )
+        progress_ts = init_resp["ts"]  # 消息 timestamp，用于后续更新
 
         # 在后台线程中执行（避免阻塞 Slack 事件循环）
         def _do_generate():
             try:
-                # 为某个商家生成count篇blogs
-                results = generate_multiple_blogs(merchant_id, merchant_cfg, count)
+                # 进度回调 — 更新同一条 Slack 消息
+                def _on_progress(stage, extra="", post_index=1, post_total=count):
+                    try:
+                        blocks = build_progress_blocks(
+                            store_name, stage,
+                            post_index=post_index, post_total=post_total,
+                            extra_info=extra,
+                        )
+                        client.chat_update(
+                            channel=channel, ts=progress_ts,
+                            text=f"Generating blog for {store_name}...",
+                            blocks=blocks,
+                        )
+                    except Exception:
+                        pass  # 更新失败不阻断
+
+                results = generate_multiple_blogs(
+                    merchant_id, merchant_cfg, count,
+                    progress_cb=_on_progress,
+                )
+
+                # 生成完成 — 更新进度消息为 "完成"
+                try:
+                    done_blocks = build_progress_blocks(
+                        store_name, "done",
+                        post_index=count, post_total=count,
+                    )
+                    client.chat_update(
+                        channel=channel, ts=progress_ts,
+                        text=f"Blog generation complete for {store_name}",
+                        blocks=done_blocks,
+                    )
+                except Exception:
+                    pass
+
+                # 发送结果摘要（新消息）
                 blocks = build_batch_summary_blocks(results, store_name)
                 client.chat_postMessage(
                     channel=channel,
@@ -150,15 +203,8 @@ def handle_message(event: dict, say, client) -> None:
 
 @app.event("app_mention")
 def handle_mention(event: dict, say) -> None:
-    """处理 @mention 事件 — 提示用户使用 auto 指令"""
-    say(
-        ":wave: Hi! I'm the Blog Generator Bot. Here's how to use me:\n\n"
-        "• `auto 3` — Generate 3 blog posts now\n"
-        "• `auto on` — Start daily scheduled generation (default times)\n"
-        "• `auto on 09:00 14:00` — Schedule at custom times\n"
-        "• `auto off` — Stop scheduled generation\n"
-        "• `auto status` — Check schedule & recent posts"
-    )
+    """app_mention 事件 — 已在 message 事件中统一处理，此处留空防止 Slack 报错"""
+    pass
 
 
 # ── 启动 ──────────────────────────────────────────────────

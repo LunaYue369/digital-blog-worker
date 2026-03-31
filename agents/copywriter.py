@@ -31,6 +31,8 @@ def _get_client() -> OpenAI:
 def write_blog(
     merchant_id: str,
     topic: dict,
+    layout_prompt: str = "",
+    research_brief: str = "",
 ) -> tuple[dict, dict]:
     """根据选题撰写一篇完整的 SEO 博客
 
@@ -38,6 +40,8 @@ def write_blog(
         merchant_id: 商家标识
         topic: Researcher 选出的主题
             {title, primary_keyword, secondary_keywords, angle, why, estimated_word_count}
+        layout_prompt: 布局风格指令（由 template_selector 选出，注入到 prompt 中引导不同结构）
+        research_brief: Web 调研摘要（搜索竞品文章后 LLM 提炼的要点，提升内容深度）
 
     Returns:
         (blog_data, token_usage)
@@ -53,6 +57,20 @@ def write_blog(
     angle = topic.get("angle", "")
     word_count = topic.get("estimated_word_count", 1200)
 
+    # 布局风格指令 — 如果有的话，会引导 GPT 生成不同结构的文章
+    layout_section = f"\n{layout_prompt}\n" if layout_prompt else ""
+
+    # Web 调研摘要 — 如果有的话，注入竞品要点帮助 Copywriter 写出更有深度的内容
+    research_section = ""
+    if research_brief:
+        research_section = f"""
+                    ## Competitor Research & Market Intelligence
+                    The following insights were gathered from top-ranking articles on this topic.
+                    Use these data points and perspectives to write a SUPERIOR article — do NOT copy, but incorporate the facts and fill the gaps.
+
+                    {research_brief}
+                    """
+
     user_prompt = f"""Write a complete SEO blog post based on the following brief.
 
                     ## Topic Brief
@@ -61,28 +79,45 @@ def write_blog(
                     - **Secondary Keywords:** {', '.join(secondary_kws)}
                     - **Angle:** {angle}
                     - **Target Word Count:** {word_count} words (range: {word_count - 200} to {word_count + 300})
+                    {layout_section}{research_section}
+                    ## SEO Requirements (CRITICAL — follow ALL rules)
+                    1. **H1 = title only** — The H1 is in the template. Do NOT include any <h1> in your content.
+                    2. **Primary keyword in first 100 words** — MUST appear naturally in the opening paragraph.
+                    3. **H2 headings with keywords** — Every <h2> MUST contain a secondary keyword or long-tail phrase. Aim for 4-7 H2 sections.
+                    4. **H3 for sub-sections** — Nest under H2. Never skip heading levels.
+                    5. **Secondary keywords** — Each secondary keyword MUST appear at least once naturally in the article body.
+                    6. **Meta description (excerpt)** — MUST be 150-160 characters, include the primary keyword, and end with a CTA.
+                    7. **Internal links** — Include 3-5 links to the business website (services, about, contact pages). Use keyword-rich anchor text.
+                    8. **External links** — Include 1-2 links to authoritative external sources (industry organizations, manufacturers, government sites).
+                    9. **Image alt text** — Write descriptive alt text that naturally includes a keyword for each image placeholder.
 
-                    ## SEO Requirements
-                    1. Include the primary keyword in the title, first paragraph, at least 2 subheadings, and conclusion
-                    2. Use secondary keywords naturally throughout the article (each at least once)
-                    3. Write a compelling meta description (excerpt) under 160 characters
-                    4. Use H2 and H3 headings with keyword-rich text
-                    5. Include internal linking opportunities (mark with <!-- INTERNAL_LINK: topic suggestion -->)
-                    6. Write alt text for all image placeholders
+                    ## FAQ Section (REQUIRED)
+                    Every article MUST end with a FAQ section BEFORE the CTA. Use this exact HTML:
+                    ```
+                    <div class="faq-section">
+                      <h2>Frequently Asked Questions</h2>
+                      <div class="faq-item"><h3>Question?</h3><p>Answer.</p></div>
+                      <!-- 3-5 Q&A pairs total -->
+                    </div>
+                    ```
+                    - Questions should match "People Also Ask" style queries related to the topic
+                    - Answers should be concise (2-3 sentences) and directly answer the question
 
                     ## Content Quality Requirements
                     1. **Expert Depth** — Write as an industry authority with specific details, numbers, and actionable advice
                     2. **Scannable Structure** — Short paragraphs (2-3 sentences max), bullet lists, numbered steps
                     3. **Engaging Opening** — Hook the reader in the first 2 sentences with a relatable scenario or surprising fact
-                    4. **Strong CTA** — End with a clear call-to-action that drives readers to contact the business
+                    4. **Strong CTA** — End with a clear call-to-action that drives readers to contact the business (AFTER the FAQ)
                     5. **No Fluff** — Every paragraph must provide value; cut generic filler
 
                     ## HTML Format
                     - Use semantic HTML: <h2>, <h3>, <p>, <ul>, <ol>, <blockquote>
-                    - Add CSS classes for styling: "blog-section", "blog-highlight", "blog-cta"
+                    - Add CSS classes for styling: "blog-section", "blog-highlight", "blog-cta", "faq-section", "faq-item"
                     - Include exactly 3 image placeholders: <!-- BLOG_IMAGE:hero -->, <!-- BLOG_IMAGE:mid -->, <!-- BLOG_IMAGE:end -->
-                    - Do NOT include <html>, <head>, <body> tags — only the article body content
+                    - Do NOT include <html>, <head>, <body>, or <h1> tags — only the article body content
+                    - Do NOT use emoji or special Unicode icons in headings (h2, h3) — plain text only
                     - Use <hr> between major sections
+                    - Article structure order: Opening → Sections → FAQ → CTA
 
                     ## Output Format (JSON)
                     Return ONLY valid JSON:

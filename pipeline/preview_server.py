@@ -8,8 +8,11 @@
 
 import base64
 import logging
+import math
 import os
+import re
 import threading
+from datetime import date
 from functools import partial
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -40,6 +43,7 @@ def render_blog_html(
     image_paths: dict[str, Path],
     merchant_cfg: dict,
     output_path: Path,
+    template_file: str = "",
 ) -> str:
     """将博客数据渲染为完整的 HTML 文件
 
@@ -48,6 +52,7 @@ def render_blog_html(
         image_paths: 图片路径 {"hero": Path, "mid": Path, "end": Path}
         merchant_cfg: 商家配置
         output_path: HTML 输出路径
+        template_file: 指定使用的模板文件名（留空则用默认模板）
 
     Returns:
         预览 URL
@@ -68,33 +73,59 @@ def render_blog_html(
     mid_uri = _image_to_data_uri(image_paths.get("mid")) if image_paths.get("mid") else ""
     end_uri = _image_to_data_uri(image_paths.get("end")) if image_paths.get("end") else ""
 
-    # 替换内容中的图片占位符
+    # 替换内容中的图片占位符（有图嵌入，无图删除占位符）
     if hero_uri:
         content_html = content_html.replace(
             "<!-- BLOG_IMAGE:hero -->",
-            f'<div class="blog-image hero-inline"><img src="{hero_uri}" alt="{title}" loading="lazy"></div>'
+            f'<div class="blog-image hero-inline"><img src="{hero_uri}" alt="{title}" loading="eager"></div>'
         )
+    else:
+        content_html = content_html.replace("<!-- BLOG_IMAGE:hero -->", "")
+
     if mid_uri:
         content_html = content_html.replace(
             "<!-- BLOG_IMAGE:mid -->",
             f'<div class="blog-image mid-image"><img src="{mid_uri}" alt="Article illustration" loading="lazy"></div>'
         )
+    else:
+        content_html = content_html.replace("<!-- BLOG_IMAGE:mid -->", "")
+
     if end_uri:
         content_html = content_html.replace(
             "<!-- BLOG_IMAGE:end -->",
             f'<div class="blog-image end-image"><img src="{end_uri}" alt="Professional service" loading="lazy"></div>'
         )
+    else:
+        content_html = content_html.replace("<!-- BLOG_IMAGE:end -->", "")
 
     # 生成标签 HTML
     tags_html = "".join(f'<span class="tag">{tag}</span>' for tag in tags)
 
-    # 读取 HTML 模板
-    template_path = cfg.TEMPLATES_DIR / "blog_template.html"
+    # 读取 HTML 模板 — 从商家 templates/ 目录加载
+    merchant_id = merchant_cfg.get("merchant_id", "")
+    if template_file:
+        from services.template_selector import get_template_path
+        template_path = get_template_path(template_file, merchant_id=merchant_id)
+    else:
+        # 兼容旧逻辑：未指定时用默认模板（优先商家目录）
+        merchant_tpl = cfg.MERCHANTS_DIR / merchant_id / "templates" / "blog_template.html"
+        template_path = merchant_tpl if merchant_tpl.exists() else cfg.TEMPLATES_DIR / "blog_template.html"
+
     if template_path.exists():
         template = template_path.read_text(encoding="utf-8")
     else:
-        log.warning("HTML 模板不存在，使用内置模板")
+        log.warning("HTML 模板不存在: %s，使用内置模板", template_path)
         template = _FALLBACK_TEMPLATE
+
+    # ── SEO 变量计算 ──
+    seo_slug = blog_data.get("seo_slug", "blog-post")
+    canonical_url = f"{website.rstrip('/')}/blog/{seo_slug}/"
+    today = date.today()
+    date_iso = today.isoformat()                      # 2026-03-31
+    date_display = today.strftime("%B %d, %Y")        # March 31, 2026
+    # 阅读时间：按英文 238 wpm 计算（取整，至少 1 分钟）
+    word_count = len(re.sub(r"<[^>]+>", "", content_html).split())
+    reading_time = str(max(1, math.ceil(word_count / 238)))
 
     # 填充模板变量
     html = template.replace("{{TITLE}}", title)
@@ -106,6 +137,11 @@ def render_blog_html(
     html = html.replace("{{WEBSITE}}", website)
     html = html.replace("{{PRIMARY_COLOR}}", primary_color)
     html = html.replace("{{ACCENT_COLOR}}", accent_color)
+    # SEO 新增变量
+    html = html.replace("{{CANONICAL_URL}}", canonical_url)
+    html = html.replace("{{DATE_ISO}}", date_iso)
+    html = html.replace("{{DATE_DISPLAY}}", date_display)
+    html = html.replace("{{READING_TIME}}", reading_time)
 
     # 写入文件
     output_path.parent.mkdir(parents=True, exist_ok=True)

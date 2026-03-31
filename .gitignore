@@ -3,9 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-output/*.html
-output/*.png
-output/*.jpg
+output/
 store/*.json
 logs/
 .DS_Store

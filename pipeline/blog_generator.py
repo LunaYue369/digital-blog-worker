@@ -27,8 +27,10 @@ from agents.artist import enhance_image_prompts
 from core.merchant_config import get_seed_keywords
 from pipeline.trend_scraper import scrape_trending
 from pipeline.preview_server import render_blog_html
+from pipeline.web_researcher import research_topic
+from services.template_selector import pick_template_and_layout
 from services.seedream_client import SeedreamClient
-from services.usage_tracker import record_usage, format_usage_report, save_to_disk
+from services.usage_tracker import record_usage, format_usage_report, save_to_disk, set_current_session
 from store.blog_store import save_draft, get_recent_titles
 
 log = logging.getLogger(__name__)
@@ -54,27 +56,56 @@ def _generate_single_inner(
     session_id: str,
     topic_index: int = 0,
     pre_scraped_topics: list[dict] | None = None,
+    exclude_template: str | None = None,
+    exclude_layout: str | None = None,
+    progress_cb=None,
 ) -> dict:
     """单篇博客生成的核心逻辑（不加锁）
     此函数不持有任何锁，由 generate_single_blog / generate_multiple_blogs 负责加锁后调用。
     在 auto n指令里的generate multiple blogs里被使用
     也在auto on指令里定时发送一篇blog的generate single blog里被使用
+    exclude_template: 上一篇用的模板文件名，批量生成时避免连续相同
+    exclude_layout: 上一篇用的布局名称，批量生成时避免连续相同
     """
     output_dir = Path(merchant_cfg.get("output_dir", str(cfg.OUTPUT_DIR / merchant_id)))
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # 设置当前线程的 session_id，所有 agent 的 record_usage 自动关联
+    set_current_session(session_id)
+
+    # 计时器
+    _t_start = time.time()
+    _t_stages: dict[str, float] = {}
+    _t_last = _t_start
+
+    # 进度回调辅助（同时记录每阶段耗时）
+    def _progress(stage: str, extra: str = ""):
+        nonlocal _t_last
+        now = time.time()
+        if _t_last != _t_start:
+            # 记录上一个阶段的耗时
+            pass
+        _t_stages[stage] = now
+        _t_last = now
+        if progress_cb:
+            try:
+                progress_cb(stage, extra)
+            except Exception:
+                pass
+
     try:
         # ── Step 1: 获取候选主题 ──────────────────────────────
-        # 所有主题
         if pre_scraped_topics:
             topics = pre_scraped_topics
             log.info("[%s] 使用预爬取的 %d 个候选主题", merchant_id, len(topics))
         else:
+            _progress("scrape")
             log.info("[%s] Step 1: 爬取热词...", merchant_id)
             seed_keywords = get_seed_keywords(merchant_id)
             trending_data = scrape_trending(seed_keywords, max_total=cfg.SCRAPE_MAX_ITEMS)
             log.info("[%s] 爬取到 %d 条热词数据", merchant_id, len(trending_data))
 
+            _progress("research")
             recent_titles = get_recent_titles(merchant_id)
             topics, _ = analyze_and_pick_topics(
                 merchant_id, trending_data, recent_titles, count=max(3, topic_index + 1)
@@ -86,14 +117,38 @@ def _generate_single_inner(
                 "session_id": session_id, "title": "", "preview_url": "",
             }
 
-        # 该篇选用的主题
         chosen_topic = topics[topic_index]
-        log.info("[%s] Step 1 完成 — 选题: %s", merchant_id, chosen_topic.get("title", ""))
+        topic_title = chosen_topic.get("title", "")
+        log.info("[%s] Step 1 完成 — 选题: %s", merchant_id, topic_title)
+
+        # ── Step 1.5: 选择 HTML 模板 + 内容布局风格 ─────────────
+        _progress("template", f"Topic: {topic_title}")
+        style_choice = pick_template_and_layout(
+            merchant_id,
+            merchant_cfg=merchant_cfg,
+            exclude_template=exclude_template,
+            exclude_layout=exclude_layout,
+        )
+        log.info("[%s] 风格选择 — 模板: %s | 布局: %s",
+                 merchant_id, style_choice["template_name"], style_choice["layout_label"])
+
+        # ── Step 1.8: Web Research — 搜索竞品文章提取要点 ────
+        _progress("web", f"Template: {style_choice['template_name']} | Layout: {style_choice['layout_label']}")
+        log.info("[%s] Step 1.8: Web Research 调研竞品...", merchant_id)
+        research_brief = research_topic(merchant_id, chosen_topic)
+        if research_brief:
+            log.info("[%s] Step 1.8 完成 — 调研摘要 %d 字符", merchant_id, len(research_brief))
+        else:
+            log.info("[%s] Step 1.8 跳过 — 无调研数据，继续生成", merchant_id)
 
         # ── Step 2: Copywriter 撰写博客 ──────────────────────
+        _progress("write", f"Topic: {topic_title}")
         log.info("[%s] Step 2: Copywriter 撰写博客...", merchant_id)
-        # 使用copywriter人格根据某个主题写一篇博客的文本内容
-        blog_data, _ = write_blog(merchant_id, chosen_topic)
+        blog_data, _ = write_blog(
+            merchant_id, chosen_topic,
+            layout_prompt=style_choice["layout_prompt"],
+            research_brief=research_brief,
+        )
         log.info("[%s] Step 2 完成 — '%s'", merchant_id, blog_data.get("title", ""))
 
         # ── Step 3: Reviewer 审核（最多 N 轮）────────────────
@@ -102,10 +157,9 @@ def _generate_single_inner(
         max_rounds = cfg.REVIEWER_MAX_ROUNDS
         min_score = cfg.REVIEWER_MIN_SCORE
 
-        # 多轮审核，审核文本和图片的prompt，若最后审核还是不通过，就要最终的
         for round_num in range(1, max_rounds + 1):
+            _progress("review", f"Review round {round_num}/{max_rounds}")
             log.info("[%s] Step 3: Reviewer 审核 (round %d/%d)...", merchant_id, round_num, max_rounds)
-            # 使用reviewer人格
             feedback, _ = review_blog(merchant_id, blog_data, chosen_topic, round_num)
             review_score = feedback.get("score", 0)
             review_rounds = round_num
@@ -115,14 +169,15 @@ def _generate_single_inner(
                 break
 
             if round_num < max_rounds:
+                _progress("rewrite", f"Score {review_score}/100 — revising (round {round_num})")
                 log.info("[%s] Step 3 未通过 (%d/100)，打回重写...", merchant_id, review_score)
                 blog_data, _ = rewrite_blog(merchant_id, blog_data, feedback, round_num)
             else:
                 log.warning("[%s] Step 3 最终轮仍未通过 (%d/100)，使用当前版本", merchant_id, review_score)
 
         # ── Step 4: Artist 美化图片 prompt ───────────────────
+        _progress("artist", f"Score: {review_score}/100")
         log.info("[%s] Step 4: Artist 美化图片 prompt...", merchant_id)
-        # 拿出copywriter写的image_prompts，交给artist人格美化
         raw_image_prompts = blog_data.get("image_prompts", {})
         if isinstance(raw_image_prompts, dict) and raw_image_prompts:
             enhanced_prompts, _ = enhance_image_prompts(
@@ -138,6 +193,7 @@ def _generate_single_inner(
         log.info("[%s] Step 4 完成", merchant_id)
 
         # ── Step 5: Seedream 生成配图 ─────────────────────────
+        _progress("image", "Generating 3 images (hero, mid, end)")
         log.info("[%s] Step 5: Seedream 生成配图...", merchant_id)
         image_paths = {}
         try:
@@ -149,18 +205,17 @@ def _generate_single_inner(
                 paths = seedream.text_to_image(prompt, output_dir)
                 if paths:
                     image_paths[slot] = paths[0]
-                    # 记录图片用量
                     record_usage(
                         merchant_id, "seedream", cfg.SEEDREAM_MODEL,
                         image_count=1, session_id=session_id,
                     )
         except Exception as img_err:
             log.error("[%s] Seedream 生图失败: %s", merchant_id, img_err)
-            # 生图失败不阻断流程，继续用占位符
 
         log.info("[%s] Step 5 完成 — 生成 %d 张图片", merchant_id, len(image_paths))
 
         # ── Step 6: 组装 HTML + 保存 ─────────────────────────
+        _progress("render", f"{len(image_paths)} images ready")
         log.info("[%s] Step 6: 组装 HTML 并保存...", merchant_id)
         timestamp = int(time.time())
         filename = f"{merchant_id}_{timestamp}_{uuid.uuid4().hex[:4]}.html"
@@ -171,6 +226,7 @@ def _generate_single_inner(
             image_paths=image_paths,
             merchant_cfg=merchant_cfg,
             output_path=output_path,
+            template_file=style_choice["template_file"],
         )
 
         # 保存草稿记录
@@ -185,7 +241,11 @@ def _generate_single_inner(
         )
 
         usage_report = format_usage_report(session_id)
-        log.info("[%s] Step 6 完成 — 预览: %s", merchant_id, preview_url)
+        total_seconds = int(time.time() - _t_start)
+        total_minutes = total_seconds // 60
+        total_secs = total_seconds % 60
+        generation_time = f"{total_minutes}m {total_secs}s" if total_minutes else f"{total_secs}s"
+        log.info("[%s] Step 6 完成 — 预览: %s (耗时 %s)", merchant_id, preview_url, generation_time)
 
         return {
             "success": True,
@@ -196,6 +256,12 @@ def _generate_single_inner(
             "review_rounds": review_rounds,
             "session_id": session_id,
             "usage_report": usage_report,
+            "generation_time": generation_time,
+            # 记录本篇使用的模板和布局，供批量生成时排除避免连续相同
+            "template_file": style_choice["template_file"],
+            "template_name": style_choice["template_name"],
+            "layout_name": style_choice["layout_name"],
+            "layout_label": style_choice["layout_label"],
         }
 
     except Exception as exc:
@@ -218,6 +284,7 @@ def generate_single_blog(
     session_id: str = "",
     topic_index: int = 0,
     pre_scraped_topics: list[dict] | None = None,
+    progress_cb=None,
 ) -> dict:
     """生成单篇 SEO 博客（线程安全）
 
@@ -250,6 +317,8 @@ def generate_single_blog(
     try:
         return _generate_single_inner(
             merchant_id, merchant_cfg, session_id, topic_index, pre_scraped_topics,
+            exclude_template=None, exclude_layout=None,
+            progress_cb=progress_cb,
         )
     finally:
         merchant_lock.release()
@@ -264,6 +333,7 @@ def generate_multiple_blogs(
     merchant_id: str,
     merchant_cfg: dict,
     count: int = 1,
+    progress_cb=None,
 ) -> list[dict]:
     """为某一个商家生成多篇 SEO 博客（线程安全）
 
@@ -304,20 +374,35 @@ def generate_multiple_blogs(
             return [{"success": False, "error": "No topics found", "title": "", "preview_url": ""}]
 
         # 根据每个topic逐篇生成（已持有锁，直接调用内部逻辑避免重复抢锁）
+        # 记录上一篇的模板和布局，传给下一篇避免连续重复
         results = []
+        prev_template = None
+        prev_layout = None
         for i in range(min(count, len(topics))):
             log.info("[%s] 正在生成第 %d/%d 篇...", merchant_id, i + 1, count)
             session_id = f"{merchant_id}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-            
-            # 
+
+            # 批量生成时，包装 progress_cb 加入篇数信息
+            def _batch_progress(stage, extra="", _idx=i):
+                if progress_cb:
+                    progress_cb(stage, extra, post_index=_idx + 1, post_total=count)
+
             result = _generate_single_inner(
                 merchant_id=merchant_id,
                 merchant_cfg=merchant_cfg,
                 session_id=session_id,
                 topic_index=i,
                 pre_scraped_topics=topics,
+                exclude_template=prev_template,
+                exclude_layout=prev_layout,
+                progress_cb=_batch_progress,
             )
             results.append(result)
+
+            # 记录本篇的模板和布局，下一篇排除
+            if result.get("success"):
+                prev_template = result.get("template_file")
+                prev_layout = result.get("layout_name")
 
         log.info("[%s] 批量生成完成: %d/%d 成功",
                  merchant_id, sum(1 for r in results if r.get("success")), count)
