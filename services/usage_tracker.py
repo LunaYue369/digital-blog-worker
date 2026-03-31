@@ -20,6 +20,19 @@ _lock = threading.Lock()
 # 内存中的用量记录（按 session_id 分组）
 _sessions: dict[str, dict] = {}
 
+# 线程局部存储 — 让 agent 调用 record_usage 时自动关联 session_id
+_thread_local = threading.local()
+
+
+def set_current_session(session_id: str) -> None:
+    """设置当前线程的活跃 session_id（由 blog_generator 在生成开始时调用）"""
+    _thread_local.session_id = session_id
+
+
+def get_current_session() -> str:
+    """获取当前线程的活跃 session_id"""
+    return getattr(_thread_local, "session_id", "")
+
 # ── 模型价格表（每百万 token / 每张图片，美元）─────────────
 _PRICE_TABLE = {
     # OpenAI 文本模型
@@ -77,6 +90,10 @@ def record_usage(
     Returns:
         本次记录的用量字典
     """
+    # 如果调用方没传 session_id，从线程局部存储获取（blog_generator 会在生成开始时设置）
+    if not session_id:
+        session_id = get_current_session()
+
     cost = _estimate_cost(model, prompt_tokens, completion_tokens, image_count)
 
     record = {
