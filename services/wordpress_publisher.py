@@ -201,41 +201,88 @@ class WordPressPublisher:
     # ── 内容处理 ────────────────────────────────────────────
 
     @staticmethod
-    def _replace_base64_images(content_html: str, image_url_map: dict[str, str]) -> str:
-        """替换文章内容中的 base64 data URI 为 WordPress 媒体库 URL
+    def _insert_images(content_html: str, image_url_map: dict[str, str],
+                       title: str = "", image_alts: dict[str, str] | None = None) -> str:
+        """将 WP 媒体库图片 URL 插入文章内容
 
-        blog_generator 渲染 HTML 时会把图片嵌入为 base64 data URI。
-        发布到 WordPress 前需要替换为媒体库的真实 URL。
-
-        Args:
-            content_html: 包含 base64 图片的 HTML 内容
-            image_url_map: {slot: wp_url}，如 {"hero": "https://xxx.com/wp-content/...jpg"}
-
-        Returns:
-            替换后的 HTML 内容
+        Copywriter 输出的 content_html 含 <!-- BLOG_IMAGE:hero/mid/end --> 占位符。
+        替换为带 WP 图片 URL 的 <img> 标签。兼容已嵌入 base64 的旧路径。
         """
-        # 找到所有 data:image/...;base64,... 格式的 URI
-        # 按照 CSS class 来匹配 slot（hero-inline, mid-image, end-image）
         slot_class_map = {
             "hero": "hero-inline",
             "mid": "mid-image",
             "end": "end-image",
         }
+        # 优先用 Copywriter 提供的 SEO alt text
+        slot_alt_map = {
+            "hero": (image_alts or {}).get("hero", title or "Blog post image"),
+            "mid": (image_alts or {}).get("mid", f"{title} - detail"),
+            "end": (image_alts or {}).get("end", f"{title} - service"),
+        }
 
+        inserted_count = 0
         for slot, wp_url in image_url_map.items():
             if not wp_url:
                 continue
 
             css_class = slot_class_map.get(slot, "")
+            alt_text = slot_alt_map.get(slot, "")
+            loading = "eager" if slot == "hero" else "lazy"
+
+            # 方式 1：替换 <!-- BLOG_IMAGE:slot --> 注释占位符（主要路径）
+            placeholder = f"<!-- BLOG_IMAGE:{slot} -->"
+            if placeholder in content_html:
+                img_html = (
+                    f'<div class="blog-image {css_class}">'
+                    f'<img src="{wp_url}" alt="{alt_text}" loading="{loading}">'
+                    f'</div>'
+                )
+                content_html = content_html.replace(placeholder, img_html, 1)
+                inserted_count += 1
+                continue
+
+            # 方式 2：替换已嵌入的 base64 data URI（兼容旧路径）
             if css_class:
-                # 匹配包含特定 class 的 <img> 标签中的 src="data:..."
-                # 将整个 data URI 替换为 WP URL
                 pattern = (
                     rf'(<div\s+class="blog-image\s+{re.escape(css_class)}">'
                     rf'\s*<img\s+src=")data:image/[^"]*(")'
                 )
                 replacement = rf'\g<1>{wp_url}\g<2>'
-                content_html = re.sub(pattern, replacement, content_html, count=1)
+                new_html = re.sub(pattern, replacement, content_html, count=1)
+                if new_html != content_html:
+                    content_html = new_html
+                    inserted_count += 1
+
+        # 安全网：仅在占位符/base64 都没匹配到时才触发
+        # 防止场景 C（占位符 + 假标签同时存在）导致图片重复
+        fake_img_pattern = re.compile(r'<img\s+[^>]*src="(/images/[^"]+)"[^>]*/?\s*>')
+        if inserted_count > 0:
+            # 占位符已成功插入真图 → 假标签直接删掉，不替换
+            content_html, fake_count = fake_img_pattern.subn("", content_html)
+            if fake_count:
+                log.warning("[%s] 删除了 %d 个多余的假 <img> 标签（真图已通过占位符插入）", "wp", fake_count)
+        else:
+            # 没有占位符 → 假标签是唯一的图片位置，替换为真图
+            fake_matches = list(fake_img_pattern.finditer(content_html))
+            if fake_matches:
+                slots = list(image_url_map.keys())
+                for i, match in enumerate(reversed(fake_matches)):
+                    slot_idx = len(fake_matches) - 1 - i
+                    if slot_idx < len(slots):
+                        slot = slots[slot_idx]
+                        wp_url = image_url_map[slot]
+                        css_class = slot_class_map.get(slot, "")
+                        alt_text = slot_alt_map.get(slot, "")
+                        loading = "eager" if slot == "hero" else "lazy"
+                        replacement = (
+                            f'<div class="blog-image {css_class}">'
+                            f'<img src="{wp_url}" alt="{alt_text}" loading="{loading}">'
+                            f'</div>'
+                        )
+                    else:
+                        replacement = ""
+                    content_html = content_html[:match.start()] + replacement + content_html[match.end():]
+                log.warning("[%s] 安全网触发：替换了 %d 个假 <img> 标签为真图", "wp", len(fake_matches))
 
         return content_html
 
@@ -279,6 +326,7 @@ class WordPressPublisher:
         excerpt = blog_data.get("excerpt", "")
         tags = blog_data.get("tags", [])
         seo_slug = blog_data.get("seo_slug", "")
+        image_alts = blog_data.get("image_alts", {})
 
         log.info("[%s] 开始发布到 WordPress: %s", self.merchant_id, title)
 
@@ -292,8 +340,8 @@ class WordPressPublisher:
             if not img_path:
                 continue
 
-            # 用标题作为 alt text 的一部分（SEO 友好）
-            alt_text = f"{title} - {slot} image"
+            # 用 Copywriter 提供的 SEO alt text（没有就用标题）
+            alt_text = image_alts.get(slot, f"{title} - {slot} image")
             result = self.upload_image(img_path, alt_text=alt_text)
 
             if result["success"]:
@@ -304,15 +352,33 @@ class WordPressPublisher:
 
         log.info("[%s] 图片上传完成: %d/3 成功", self.merchant_id, len(uploaded_images))
 
-        # ── Step 2: 替换 content 中的 base64 图片 ─────────
+        # ── Step 2: 将 WP 图片 URL 插入 content 占位符 ─────
         if image_url_map:
-            content_html = self._replace_base64_images(content_html, image_url_map)
-            log.info("[%s] Step 2: 已替换 %d 张图片的 base64 → WP URL", self.merchant_id, len(image_url_map))
+            content_html = self._insert_images(content_html, image_url_map, title, image_alts)
+            log.info("[%s] Step 2: 已插入 %d 张图片到文章内容", self.merchant_id, len(image_url_map))
 
         # ── Step 3: 处理标签 ──────────────────────────────
         log.info("[%s] Step 3: 处理标签...", self.merchant_id)
         tag_ids = self._resolve_tags(tags)
         log.info("[%s] 标签处理完成: %d 个标签", self.merchant_id, len(tag_ids))
+
+        # ── Step 3.5: 将 tags 追加到正文末尾（链接到 WP tag 归档页）──
+        if tags:
+            tag_links = []
+            for t in tags:
+                # WP tag slug: 小写 + 空格转连字符
+                tag_slug = re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")
+                tag_url = f"{self.wp_url}/tag/{tag_slug}/"
+                tag_links.append(
+                    f'<a href="{tag_url}" rel="tag" style="display:inline-block;'
+                    f'background:#f0f0f0;color:#333;padding:4px 14px;'
+                    f'border-radius:20px;margin:4px 6px 4px 0;font-size:0.85em;'
+                    f'text-decoration:none;">{t}</a>'
+                )
+            content_html += (
+                f'\n<div style="margin-top:40px;padding-top:24px;'
+                f'border-top:1px solid #e0e0e0;">{"".join(tag_links)}</div>'
+            )
 
         # ── Step 4: 创建文章 ──────────────────────────────
         log.info("[%s] Step 4: 创建文章 (status=%s)...", self.merchant_id, status)
@@ -347,7 +413,29 @@ class WordPressPublisher:
             post_url = post.get("link", "")
             edit_url = f"{self.wp_url}/wp-admin/post.php?post={post_id}&action=edit"
 
+            # 将上传的图片附加到文章（WP 媒体库显示"已附加"而非"尚未附加"）
+            if post_id and uploaded_images:
+                for slot, media_info in uploaded_images.items():
+                    media_id = media_info.get("id", 0)
+                    if media_id:
+                        try:
+                            requests.post(
+                                f"{self.api_base}/media/{media_id}",
+                                auth=self._auth,
+                                json={"post": post_id},
+                                timeout=_TIMEOUT,
+                            )
+                        except Exception:
+                            pass  # 附加失败不影响主流程
+
             log.info("[%s] 文章发布成功: ID=%d URL=%s", self.merchant_id, post_id, post_url)
+
+            # 收集已上传图片的文件名（slot → filename）
+            image_names = {}
+            for slot in ["hero", "mid", "end"]:
+                img_path = image_paths.get(slot)
+                if img_path and slot in uploaded_images:
+                    image_names[slot] = Path(img_path).name if hasattr(img_path, 'name') else str(img_path).split("/")[-1].split("\\")[-1]
 
             return {
                 "success": True,
@@ -356,6 +444,7 @@ class WordPressPublisher:
                 "edit_url": edit_url,
                 "status": status,
                 "images_uploaded": len(uploaded_images),
+                "image_names": image_names,
                 "tags_count": len(tag_ids),
             }
 

@@ -114,7 +114,8 @@ def write_blog(
                     ## HTML Format
                     - Use semantic HTML: <h2>, <h3>, <p>, <ul>, <ol>, <blockquote>
                     - Add CSS classes for styling: "blog-section", "blog-highlight", "blog-cta", "faq-section", "faq-item"
-                    - Include exactly 3 image placeholders: <!-- BLOG_IMAGE:hero -->, <!-- BLOG_IMAGE:mid -->, <!-- BLOG_IMAGE:end -->
+                    - Include exactly 3 image placeholders as HTML comments: <!-- BLOG_IMAGE:hero -->, <!-- BLOG_IMAGE:mid -->, <!-- BLOG_IMAGE:end -->
+                    - CRITICAL: Image placeholders MUST be the exact HTML comments above. Do NOT write <img> tags, do NOT invent image URLs like /images/xxx.jpg. The image system replaces these comment placeholders with real images later. Any <img> tag you write will show as a broken image.
                     - Do NOT include <html>, <head>, <body>, or <h1> tags — only the article body content
                     - ABSOLUTELY NO emoji, icons, or special Unicode characters anywhere in the HTML — not in headings, not in paragraphs, not in lists. Use plain ASCII text only. Emoji will break rendering.
                     - Use <hr> between major sections
@@ -132,6 +133,11 @@ def write_blog(
                             "hero": "Detailed prompt for the hero/banner image — professional, high-end, relevant to the topic. No text or logos in the image.",
                             "mid": "Prompt for mid-article image — illustrates a key point. No text or logos.",
                             "end": "Prompt for end-of-article image — reinforces the CTA or conclusion. No text or logos."
+                        }},
+                        "image_alts": {{
+                            "hero": "SEO-optimized alt text for hero image — describe the scene, include primary keyword naturally",
+                            "mid": "SEO-optimized alt text for mid image — describe what is shown, include a relevant keyword",
+                            "end": "SEO-optimized alt text for end image — describe the scene, include brand or location keyword"
                         }}
                     }}"""
 
