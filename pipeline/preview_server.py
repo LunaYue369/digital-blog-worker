@@ -73,11 +73,17 @@ def render_blog_html(
     mid_uri = _image_to_data_uri(image_paths.get("mid")) if image_paths.get("mid") else ""
     end_uri = _image_to_data_uri(image_paths.get("end")) if image_paths.get("end") else ""
 
+    # Copywriter 提供的 SEO alt text（没有就用默认值）
+    image_alts = blog_data.get("image_alts", {})
+    hero_alt = image_alts.get("hero", title)
+    mid_alt = image_alts.get("mid", f"{title} - detail")
+    end_alt = image_alts.get("end", f"{title} - service")
+
     # 替换内容中的图片占位符（有图嵌入，无图删除占位符）
     if hero_uri:
         content_html = content_html.replace(
             "<!-- BLOG_IMAGE:hero -->",
-            f'<div class="blog-image hero-inline"><img src="{hero_uri}" alt="{title}" loading="eager"></div>'
+            f'<div class="blog-image hero-inline"><img src="{hero_uri}" alt="{hero_alt}" loading="eager"></div>'
         )
     else:
         content_html = content_html.replace("<!-- BLOG_IMAGE:hero -->", "")
@@ -85,7 +91,7 @@ def render_blog_html(
     if mid_uri:
         content_html = content_html.replace(
             "<!-- BLOG_IMAGE:mid -->",
-            f'<div class="blog-image mid-image"><img src="{mid_uri}" alt="Article illustration" loading="lazy"></div>'
+            f'<div class="blog-image mid-image"><img src="{mid_uri}" alt="{mid_alt}" loading="lazy"></div>'
         )
     else:
         content_html = content_html.replace("<!-- BLOG_IMAGE:mid -->", "")
@@ -93,10 +99,17 @@ def render_blog_html(
     if end_uri:
         content_html = content_html.replace(
             "<!-- BLOG_IMAGE:end -->",
-            f'<div class="blog-image end-image"><img src="{end_uri}" alt="Professional service" loading="lazy"></div>'
+            f'<div class="blog-image end-image"><img src="{end_uri}" alt="{end_alt}" loading="lazy"></div>'
         )
     else:
         content_html = content_html.replace("<!-- BLOG_IMAGE:end -->", "")
+
+    # 安全网：Copywriter 偶尔编造 <img src="/images/xxx.jpg"> 假标签，直接删掉
+    # （真图已通过占位符或模板 {{HERO_IMAGE}} 嵌入，不需要重复）
+    fake_img_pattern = re.compile(r'<img\s+[^>]*src="(/images/[^"]+)"[^>]*/?\s*>')
+    content_html, fake_count = fake_img_pattern.subn("", content_html)
+    if fake_count:
+        log.warning("安全网触发：删除了 %d 个 Copywriter 编造的假 <img> 标签", fake_count)
 
     # 安全措施：移除 HTML 标题中的 emoji/特殊 Unicode 字符（GPT 偶尔仍会生成）
     def _strip_emoji_from_headings(html: str) -> str:

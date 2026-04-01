@@ -20,6 +20,7 @@ import logging
 import re
 import sys
 import threading
+from pathlib import Path
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -257,22 +258,37 @@ def _handle_publish(text: str, channel: str, say, client) -> None:
             "excerpt": draft.get("excerpt", ""),
             "tags": draft.get("tags", []),
             "seo_slug": draft.get("seo_slug", ""),
+            "image_alts": draft.get("image_alts", {}),
         }
 
-        # 手动发布时没有本地图片路径（图片已经在生成时嵌入 HTML 或丢失了）
-        # 所以传空 image_paths — WordPress 发布器会跳过图片上传
+        # 从草稿记录读取图片路径
+        image_paths = {}
+        saved_paths = draft.get("image_paths", {})
+        for slot, path_str in saved_paths.items():
+            p = Path(path_str)
+            if p.exists():
+                image_paths[slot] = p
+
         wp_result = publisher.publish_blog(
             blog_data=blog_data,
-            image_paths={},
+            image_paths=image_paths,
             status="private",
         )
 
         if wp_result.get("success"):
             post_url = wp_result.get("post_url", "")
             edit_url = wp_result.get("edit_url", "")
+            img_count = wp_result.get("images_uploaded", 0)
+            tag_count = wp_result.get("tags_count", 0)
+            image_names = wp_result.get("image_names", {})
+            img_lines = "\n".join(
+                f"  • `{slot}`: `{name}`" for slot, name in image_names.items()
+            ) if image_names else "  (none)"
             say(
                 f":white_check_mark: *Published to WordPress!*\n\n"
                 f":page_facing_up: *Title:* {draft_title}\n"
+                f":framed_picture: *Images:* {img_count}/3 uploaded\n{img_lines}\n"
+                f":label: *Tags:* {tag_count}\n"
                 f":lock: *Status:* Private\n"
                 f":link: *Post:* <{post_url}|View on WordPress>\n"
                 f":pencil2: *Edit:* <{edit_url}|Open in WP Admin>"
@@ -325,19 +341,12 @@ def handle_publish_button(ack, body, client) -> None:
 
     draft_title = draft.get("title", "Untitled")
 
-    # 更新按钮所在的消息 — 替换按钮为 "Publishing..."
-    try:
-        message_ts = body["message"]["ts"]
-        client.chat_update(
-            channel=channel, ts=message_ts,
-            text=f"Publishing {draft_title}...",
-            blocks=body["message"]["blocks"][:-1] + [{  # 去掉最后的按钮 block
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": ":hourglass_flowing_sand: *Publishing to WordPress...*"},
-            }],
-        )
-    except Exception:
-        pass
+    # 发一条新消息表示开始发布（每篇独立，不会互相覆盖）
+    progress_resp = client.chat_postMessage(
+        channel=channel,
+        text=f":hourglass_flowing_sand: Publishing *{draft_title}* to WordPress...",
+    )
+    progress_ts = progress_resp["ts"]
 
     log.info("[%s] Publish 按钮点击: session=%s title=%s user=%s",
              merchant_id, session_id, draft_title, user)
@@ -351,23 +360,18 @@ def handle_publish_button(ack, body, client) -> None:
             "excerpt": draft.get("excerpt", ""),
             "tags": draft.get("tags", []),
             "seo_slug": draft.get("seo_slug", ""),
+            "image_alts": draft.get("image_alts", {}),
         }
 
-        # 尝试找到本地图片文件（按 session_id 匹配 output 目录下的 png）
-        output_dir = cfg.OUTPUT_DIR / merchant_id
+        # 从草稿记录读取图片路径（不再用时间戳猜测）
         image_paths = {}
-        if output_dir.exists():
-            # 从草稿的 filename 提取时间戳来匹配图片
-            draft_filename = draft.get("filename", "")
-            # 文件名格式: merchantid_timestamp_hash.html
-            parts = draft_filename.replace(".html", "").split("_")
-            if len(parts) >= 2:
-                ts_prefix = parts[1]  # 时间戳部分
-                png_files = sorted(output_dir.glob(f"txt2img_{ts_prefix}*.png"))
-                # 按生成顺序分配 slot
-                slot_names = ["hero", "mid", "end"]
-                for i, png in enumerate(png_files[:3]):
-                    image_paths[slot_names[i]] = png
+        saved_paths = draft.get("image_paths", {})
+        for slot, path_str in saved_paths.items():
+            p = Path(path_str)
+            if p.exists():
+                image_paths[slot] = p
+            else:
+                log.warning("[%s] 图片文件不存在: %s", merchant_id, path_str)
 
         wp_result = publisher.publish_blog(
             blog_data=blog_data,
@@ -378,36 +382,36 @@ def handle_publish_button(ack, body, client) -> None:
         if wp_result.get("success"):
             post_url = wp_result.get("post_url", "")
             edit_url = wp_result.get("edit_url", "")
-            # 更新消息 — 替换 "Publishing..." 为成功信息
-            try:
-                client.chat_update(
-                    channel=channel, ts=message_ts,
-                    text=f"Published: {draft_title}",
-                    blocks=body["message"]["blocks"][:-1] + [{
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": (
-                                f":white_check_mark: *Published to WordPress!*\n"
-                                f":lock: *Status:* Private\n"
-                                f":link: *Post:* <{post_url}|View on WordPress>\n"
-                                f":pencil2: *Edit:* <{edit_url}|Open in WP Admin>"
-                            ),
-                        },
-                    }],
-                )
-            except Exception:
-                # 如果更新失败，发新消息
-                client.chat_postMessage(
-                    channel=channel,
-                    text=(
-                        f":white_check_mark: *Published: {draft_title}*\n"
-                        f":link: <{post_url}|View on WordPress> | <{edit_url}|Edit in WP Admin>"
-                    ),
-                )
+            img_count = wp_result.get("images_uploaded", 0)
+            tag_count = wp_result.get("tags_count", 0)
+            image_names = wp_result.get("image_names", {})
+            img_lines = "\n".join(
+                f"  • `{slot}`: `{name}`" for slot, name in image_names.items()
+            ) if image_names else "  (none)"
+            publish_text = (
+                f":white_check_mark: *Published to WordPress!*\n"
+                f":page_facing_up: *Title:* {draft_title}\n"
+                f":framed_picture: *Images:* {img_count}/3 uploaded\n{img_lines}\n"
+                f":label: *Tags:* {tag_count}\n"
+                f":lock: *Status:* Private\n"
+                f":link: *Post:* <{post_url}|View on WordPress>\n"
+                f":pencil2: *Edit:* <{edit_url}|Open in WP Admin>"
+            )
+            # 更新自己的进度消息为成功信息
+            client.chat_update(
+                channel=channel, ts=progress_ts,
+                text=f"Published: {draft_title}",
+                blocks=[{
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": publish_text},
+                }],
+            )
         else:
             error = wp_result.get("error", "Unknown error")
-            client.chat_postMessage(channel=channel, text=f":x: *Publish failed:* {error}")
+            client.chat_update(
+                channel=channel, ts=progress_ts,
+                text=f":x: *Publish failed:* {draft_title}: {error}",
+            )
 
     except Exception as exc:
         log.exception("[%s] Button publish failed: %s", merchant_id, exc)

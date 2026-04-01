@@ -198,15 +198,20 @@ def _generate_single_inner(
         _progress("image", "Generating 3 images (hero, mid, end)")
         log.info("[%s] Step 5: Seedream 生成配图...", merchant_id)
         image_paths = {}
+        seo_slug = blog_data.get("seo_slug", "blog")
         try:
             seedream = SeedreamClient()
             for slot, prompt in enhanced_prompts.items():
                 if not prompt:
                     continue
                 log.info("[%s] 生成 %s 图片...", merchant_id, slot)
-                paths = seedream.text_to_image(prompt, output_dir)
-                if paths:
-                    image_paths[slot] = paths[0]
+                # 用 商家_slug_时间戳_slot.png 命名，方便辨认且唯一
+                img_filename = f"{merchant_id}_{seo_slug}_{int(time.time())}_{slot}.png"
+                img_path = output_dir / img_filename
+                urls = seedream.generate_image(prompt=prompt, size="2K")
+                if urls:
+                    seedream.download_image(urls[0], img_path)
+                    image_paths[slot] = img_path
                     record_usage(
                         merchant_id, "seedream", cfg.SEEDREAM_MODEL,
                         image_count=1, session_id=session_id,
@@ -231,7 +236,7 @@ def _generate_single_inner(
             template_file=style_choice["template_file"],
         )
 
-        # 保存草稿记录
+        # 保存草稿记录（含图片路径，供 Publish 按钮使用）
         save_draft(
             merchant_id=merchant_id,
             title=blog_data.get("title", "Untitled"),
@@ -240,6 +245,7 @@ def _generate_single_inner(
             blog_data=blog_data,
             review_score=review_score,
             session_id=session_id,
+            image_paths={slot: str(p) for slot, p in image_paths.items()},
         )
         log.info("[%s] Step 6 完成 — 预览: %s", merchant_id, preview_url)
 

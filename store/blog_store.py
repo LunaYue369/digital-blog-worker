@@ -66,6 +66,7 @@ def save_draft(
     blog_data: dict,
     review_score: int = 0,
     session_id: str = "",
+    image_paths: dict[str, str] | None = None,
 ) -> None:
     """保存一条博客草稿记录
 
@@ -77,6 +78,7 @@ def save_draft(
         blog_data: 完整博客数据（title, excerpt, tags, seo_slug 等）
         review_score: Reviewer 评分
         session_id: 生成会话 ID
+        image_paths: 图片本地路径 {"hero": "C:/...png", "mid": "...", "end": "..."}
     """
     record = {
         "title": title,
@@ -86,8 +88,10 @@ def save_draft(
         "excerpt": blog_data.get("excerpt", ""),
         "tags": blog_data.get("tags", []),
         "seo_slug": blog_data.get("seo_slug", ""),
+        "image_alts": blog_data.get("image_alts", {}),
         "review_score": review_score,
         "session_id": session_id,
+        "image_paths": image_paths or {},
         "status": "draft",
         "created_at": time.time(),
     }
