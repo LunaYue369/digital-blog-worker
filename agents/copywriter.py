@@ -90,6 +90,7 @@ def write_blog(
                     7. **Internal links** — Include 3-5 links to the business website (services, about, contact pages). Use keyword-rich anchor text.
                     8. **External links** — Include 1-2 links to authoritative external sources (industry organizations, manufacturers, government sites).
                     9. **Image alt text** — Write descriptive alt text that naturally includes a keyword for each image placeholder.
+                    10. **No emoji** — Do NOT use any emoji or Unicode icons (e.g. 🛡️ 💰 ✅ 🔧) anywhere in the content. They break rendering. Plain text only.
 
                     ## FAQ Section (REQUIRED)
                     Every article MUST end with a FAQ section BEFORE the CTA. Use this exact HTML:
@@ -115,7 +116,7 @@ def write_blog(
                     - Add CSS classes for styling: "blog-section", "blog-highlight", "blog-cta", "faq-section", "faq-item"
                     - Include exactly 3 image placeholders: <!-- BLOG_IMAGE:hero -->, <!-- BLOG_IMAGE:mid -->, <!-- BLOG_IMAGE:end -->
                     - Do NOT include <html>, <head>, <body>, or <h1> tags — only the article body content
-                    - Do NOT use emoji or special Unicode icons in headings (h2, h3) — plain text only
+                    - ABSOLUTELY NO emoji, icons, or special Unicode characters anywhere in the HTML — not in headings, not in paragraphs, not in lists. Use plain ASCII text only. Emoji will break rendering.
                     - Use <hr> between major sections
                     - Article structure order: Opening → Sections → FAQ → CTA
 

@@ -82,6 +82,7 @@ def save_draft(
         "title": title,
         "filename": filename,
         "preview_url": preview_url,
+        "content_html": blog_data.get("content_html", ""),
         "excerpt": blog_data.get("excerpt", ""),
         "tags": blog_data.get("tags", []),
         "seo_slug": blog_data.get("seo_slug", ""),

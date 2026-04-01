@@ -39,6 +39,9 @@ def build_blog_result_blocks(
     template_name = result.get("template_name", "N/A")
     layout_label = result.get("layout_label", "N/A")
     gen_time = result.get("generation_time", "N/A")
+    wp_published = result.get("wp_published", False)
+    wp_post_url = result.get("wp_post_url", "")
+    wp_edit_url = result.get("wp_edit_url", "")
 
     # 标签格式化
     tags_text = "  ".join(f"`{t}`" for t in tags[:5]) if tags else "N/A"
@@ -112,6 +115,36 @@ def build_blog_result_blocks(
             },
         },
     ]
+
+    # ── WordPress 发布状态 / 发布按钮 ──
+    if wp_published and wp_post_url:
+        # 已发布 — 显示链接
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f":outbox_tray: *WordPress:*  Published as `private`\n"
+                    f":link: *Post:*  <{wp_post_url}|View on WordPress>\n"
+                    f":pencil2: *Edit:*  <{wp_edit_url}|Open in WP Admin>"
+                ),
+            },
+        })
+    elif not wp_published and result.get("blog_data"):
+        # 未发布 — 显示 Publish 按钮
+        # action_id 里编码 merchant_id 和 session_id，按钮点击时用来找到对应草稿
+        session_id = result.get("session_id", "")
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": ":outbox_tray: Publish to WordPress"},
+                    "style": "primary",
+                    "action_id": f"wp_publish_{session_id}",
+                },
+            ],
+        })
 
     # ── 用量信息 ──
     if usage:
@@ -286,6 +319,7 @@ PROGRESS_STAGES = [
     {"key": "artist",    "emoji": ":lower_left_paintbrush:", "label": "Enhancing image prompts"},
     {"key": "image",     "emoji": ":camera:",                "label": "Generating images (Seedream)"},
     {"key": "render",    "emoji": ":package:",               "label": "Assembling final HTML"},
+    {"key": "publish",   "emoji": ":outbox_tray:",           "label": "Publishing to WordPress"},
     {"key": "done",      "emoji": ":white_check_mark:",      "label": "Complete!"},
 ]
 
@@ -298,6 +332,7 @@ def build_progress_blocks(
     post_index: int = 1,
     post_total: int = 1,
     extra_info: str = "",
+    auto_publish: bool = True,
 ) -> list[dict]:
     """构建实时进度更新消息
 
@@ -307,6 +342,7 @@ def build_progress_blocks(
         post_index: 当前第几篇（1-based）
         post_total: 总篇数
         extra_info: 额外信息（如选中的主题名、审核轮次等）
+        auto_publish: 是否自动发布到 WordPress（False 时隐藏 publish 阶段）
     """
     current_idx = _STAGE_INDEX.get(current_stage, 0)
 
@@ -314,6 +350,8 @@ def build_progress_blocks(
     for i, stage in enumerate(PROGRESS_STAGES):
         if stage["key"] == "rewrite" and current_stage != "rewrite":
             continue  # 没有重写时跳过显示
+        if stage["key"] == "publish" and not auto_publish:
+            continue  # 手动模式下不显示 publish 阶段
 
         if i < current_idx:
             lines.append(f":white_check_mark:  {stage['label']}")
