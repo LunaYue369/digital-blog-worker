@@ -10,5 +10,8 @@
     "brand_color_primary": "#1a1a2e",
     "brand_color_accent": "#e94560",
     "blog_style": "premium",
-    "default_post_times": ["09:00", "13:00", "17:00"]
+    "default_post_times": ["09:00", "13:00", "17:00"],
+    "wordpress_url": "https://thouseirvine.com",
+    "wordpress_user": "1151512627@qq.com",
+    "wordpress_password": "tTMf IjWP gzEw GIZq elzc mjdR"
 }

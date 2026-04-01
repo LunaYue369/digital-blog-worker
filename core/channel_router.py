@@ -6,6 +6,7 @@
     auto on        → 开启定时调度（使用默认时间点）
     auto off       → 关闭定时调度
     auto status    → 查看当前调度状态
+    publish        → 手动发布最近一篇草稿到 WordPress
 """
 
 import logging

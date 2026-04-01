@@ -31,6 +31,7 @@ from pipeline.web_researcher import research_topic
 from services.template_selector import pick_template_and_layout
 from services.seedream_client import SeedreamClient
 from services.usage_tracker import record_usage, format_usage_report, save_to_disk, set_current_session
+from services.wordpress_publisher import WordPressPublisher
 from store.blog_store import save_draft, get_recent_titles
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ def _generate_single_inner(
     exclude_template: str | None = None,
     exclude_layout: str | None = None,
     progress_cb=None,
+    auto_publish: bool = True,
 ) -> dict:
     """单篇博客生成的核心逻辑（不加锁）
     此函数不持有任何锁，由 generate_single_blog / generate_multiple_blogs 负责加锁后调用。
@@ -239,13 +241,41 @@ def _generate_single_inner(
             review_score=review_score,
             session_id=session_id,
         )
+        log.info("[%s] Step 6 完成 — 预览: %s", merchant_id, preview_url)
+
+        # ── Step 7: 发布到 WordPress（auto_publish=True 且商家配了 WP 时）─
+        wp_result = {}
+        wp_url = merchant_cfg.get("wordpress_url", "")
+        if wp_url and auto_publish:
+            _progress("publish", "Uploading images & publishing to WordPress")
+            log.info("[%s] Step 7: 发布到 WordPress...", merchant_id)
+            try:
+                publisher = WordPressPublisher(merchant_id, merchant_cfg)
+                wp_result = publisher.publish_blog(
+                    blog_data=blog_data,
+                    image_paths=image_paths,
+                    status="private",
+                )
+                if wp_result.get("success"):
+                    log.info("[%s] Step 7 完成 — WP ID=%d URL=%s",
+                             merchant_id, wp_result.get("post_id", 0), wp_result.get("post_url", ""))
+                else:
+                    log.warning("[%s] Step 7 WordPress 发布失败: %s",
+                                merchant_id, wp_result.get("error", "Unknown"))
+            except Exception as wp_err:
+                log.error("[%s] Step 7 WordPress 发布异常: %s", merchant_id, wp_err)
+                wp_result = {"success": False, "error": str(wp_err)}
+        elif not wp_url:
+            log.info("[%s] 跳过 WordPress 发布（未配置 wordpress_url）", merchant_id)
+        else:
+            log.info("[%s] 跳过 WordPress 发布（手动模式，等待用户确认）", merchant_id)
 
         usage_report = format_usage_report(session_id)
         total_seconds = int(time.time() - _t_start)
         total_minutes = total_seconds // 60
         total_secs = total_seconds % 60
         generation_time = f"{total_minutes}m {total_secs}s" if total_minutes else f"{total_secs}s"
-        log.info("[%s] Step 6 完成 — 预览: %s (耗时 %s)", merchant_id, preview_url, generation_time)
+        log.info("[%s] 全流程完成 (耗时 %s)", merchant_id, generation_time)
 
         return {
             "success": True,
@@ -257,6 +287,11 @@ def _generate_single_inner(
             "session_id": session_id,
             "usage_report": usage_report,
             "generation_time": generation_time,
+            # WordPress 发布结果
+            "wp_published": wp_result.get("success", False),
+            "wp_post_url": wp_result.get("post_url", ""),
+            "wp_edit_url": wp_result.get("edit_url", ""),
+            "wp_post_id": wp_result.get("post_id", 0),
             # 记录本篇使用的模板和布局，供批量生成时排除避免连续相同
             "template_file": style_choice["template_file"],
             "template_name": style_choice["template_name"],
@@ -285,6 +320,7 @@ def generate_single_blog(
     topic_index: int = 0,
     pre_scraped_topics: list[dict] | None = None,
     progress_cb=None,
+    auto_publish: bool = True,
 ) -> dict:
     """生成单篇 SEO 博客（线程安全）
 
@@ -319,6 +355,7 @@ def generate_single_blog(
             merchant_id, merchant_cfg, session_id, topic_index, pre_scraped_topics,
             exclude_template=None, exclude_layout=None,
             progress_cb=progress_cb,
+            auto_publish=auto_publish,
         )
     finally:
         merchant_lock.release()
@@ -334,6 +371,7 @@ def generate_multiple_blogs(
     merchant_cfg: dict,
     count: int = 1,
     progress_cb=None,
+    auto_publish: bool = True,
 ) -> list[dict]:
     """为某一个商家生成多篇 SEO 博客（线程安全）
 
@@ -396,6 +434,7 @@ def generate_multiple_blogs(
                 exclude_template=prev_template,
                 exclude_layout=prev_layout,
                 progress_cb=_batch_progress,
+                auto_publish=auto_publish,
             )
             results.append(result)
 

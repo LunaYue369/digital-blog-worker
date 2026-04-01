@@ -98,6 +98,29 @@ def render_blog_html(
     else:
         content_html = content_html.replace("<!-- BLOG_IMAGE:end -->", "")
 
+    # 安全措施：移除 HTML 标题中的 emoji/特殊 Unicode 字符（GPT 偶尔仍会生成）
+    def _strip_emoji_from_headings(html: str) -> str:
+        """移除 <h2>/<h3> 标签内的 emoji 和特殊 Unicode 符号"""
+        import re as _re
+        # 匹配常见 emoji 范围（包括 supplementary 和组合字符）
+        emoji_pattern = _re.compile(
+            "[\U0001F300-\U0001F9FF"   # 杂项符号和表情
+            "\U00002702-\U000027B0"     # 装饰符号
+            "\U0000FE00-\U0000FE0F"     # 变体选择符
+            "\U0000200D"                # 零宽连接符
+            "\U000024C2-\U0001F251"     # 封闭字母数字补充
+            "]+", flags=_re.UNICODE
+        )
+        def _clean_heading(m):
+            tag = m.group(1)
+            attrs = m.group(2)
+            content = emoji_pattern.sub("", m.group(3)).strip()
+            return f"<{tag}{attrs}>{content}</{tag}>"
+        html = _re.sub(r"<(h[23])([^>]*)>(.*?)</\1>", _clean_heading, html)
+        return html
+
+    content_html = _strip_emoji_from_headings(content_html)
+
     # 生成标签 HTML
     tags_html = "".join(f'<span class="tag">{tag}</span>' for tag in tags)
 
