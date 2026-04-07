@@ -41,7 +41,8 @@ from openai import OpenAI
 
 from agents.soul_loader import build_system_prompt, get_soul
 from core import session
-from core.session import GENERATING
+from core.session import CONFIRMING, GENERATING
+from core.i18n import detect_language
 from services.usage_tracker import record_usage
 
 log = logging.getLogger(__name__)
@@ -107,10 +108,10 @@ def _build_extraction_instruction(store_name: str, merchant_id: str) -> str:
     """
     return f"""
 ## Communication Rules
-- Communicate in the same language the user uses (Chinese or English)
-- CRITICAL: All values in "params", "creative_brief", and "user_image_requests" MUST be in English
-- The blog is for an English-speaking audience. If the user speaks Chinese, translate their intent into English
-- Your "reply" to the user can be in their language
+- CRITICAL: Your "reply" MUST be in the SAME language the user is using. If the user writes in Chinese, reply in Chinese. If in English, reply in English. Match their language exactly.
+- CRITICAL: All values in "params", "creative_brief", and "user_image_requests" MUST be in English (these are internal data for the pipeline)
+- The blog article itself is always generated in English for an English-speaking audience
+- If the user speaks Chinese, translate their intent into English for params/brief/requests, but keep your "reply" in Chinese
 
 ## Reply Formatting (Slack mrkdwn — NOT standard Markdown)
 - CRITICAL: Slack bold is *single asterisk* like *this*, NOT **double asterisk**
@@ -306,6 +307,13 @@ def chat_and_maybe_generate(sess: dict, user_text: str, say, client, merchant_id
     thread_ts = sess["thread_ts"]
     store_name = merchant_cfg.get("store_name", merchant_id)
 
+    # ── 语言检测（首条消息时检测，后续沿用）──
+    if sess.get("language", "en") == "en" and user_text:
+        detected = detect_language(user_text)
+        if detected == "zh":
+            sess["language"] = "zh"
+    lang = sess.get("language", "en")
+
     # ── 1. 构建 system prompt ──
     # 尝试加载 assistant 人格，如果没有则只用 _shared
     assistant_soul = get_soul(merchant_id, "assistant")
@@ -351,7 +359,7 @@ def chat_and_maybe_generate(sess: dict, user_text: str, say, client, merchant_id
             model=MODEL,
             messages=messages,
             temperature=0.4,
-            max_tokens=2000,
+            max_tokens=3000,
             response_format={"type": "json_object"},
         )
     except Exception as e:
@@ -418,12 +426,12 @@ def chat_and_maybe_generate(sess: dict, user_text: str, say, client, merchant_id
 
     # ── 6. 判断是否开始生成 ──
     if ready:
-        say(text=f"{reply}\n\nStarting blog generation, please wait...", thread_ts=thread_ts)
-        session.update_stage(thread_ts, GENERATING)
+        # 进入确认状态，等用户点 Confirm 按钮或继续修改
+        session.update_stage(thread_ts, CONFIRMING)
 
-        # 启动 chat pipeline（在 main.py 的线程包装中已处理，这里直接调用）
-        from pipeline.chat_generator import run_chat_pipeline
-        run_chat_pipeline(sess, merchant_id, merchant_cfg, say, client)
+        from slack_ui.blocks import build_confirm_blocks
+        blocks = build_confirm_blocks(reply, lang=lang)
+        say(text=reply, blocks=blocks, thread_ts=thread_ts)
     else:
         say(text=reply, thread_ts=thread_ts)
 

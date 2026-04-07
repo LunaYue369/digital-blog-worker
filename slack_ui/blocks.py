@@ -6,6 +6,8 @@
 import logging
 import time
 
+from core.i18n import t
+
 log = logging.getLogger(__name__)
 
 
@@ -309,14 +311,14 @@ def build_generating_message(merchant_name: str, count: int) -> list[dict]:
 
 # ── Chat 模式进度阶段 ──────────────────────────────────────
 CHAT_PROGRESS_STAGES = [
-    {"key": "template",  "emoji": ":art:",                   "label": "Selecting template & layout"},
-    {"key": "web",       "emoji": ":globe_with_meridians:",  "label": "Researching competitor articles"},
-    {"key": "write",     "emoji": ":pencil:",                "label": "Writing blog content"},
-    {"key": "review",    "emoji": ":eyes:",                  "label": "Reviewing content quality"},
-    {"key": "rewrite",   "emoji": ":memo:",                  "label": "Revising based on feedback"},
-    {"key": "image",     "emoji": ":camera:",                "label": "Processing images"},
-    {"key": "render",    "emoji": ":package:",               "label": "Assembling final preview"},
-    {"key": "done",      "emoji": ":white_check_mark:",      "label": "Complete!"},
+    {"key": "template",  "emoji": ":art:",                   "i18n_key": "stage_template"},
+    {"key": "web",       "emoji": ":globe_with_meridians:",  "i18n_key": "stage_web"},
+    {"key": "write",     "emoji": ":pencil:",                "i18n_key": "stage_write"},
+    {"key": "review",    "emoji": ":eyes:",                  "i18n_key": "stage_review"},
+    {"key": "rewrite",   "emoji": ":memo:",                  "i18n_key": "stage_rewrite"},
+    {"key": "image",     "emoji": ":camera:",                "i18n_key": "stage_image"},
+    {"key": "render",    "emoji": ":package:",               "i18n_key": "stage_render"},
+    {"key": "done",      "emoji": ":white_check_mark:",      "i18n_key": "stage_done"},
 ]
 
 _CHAT_STAGE_INDEX = {s["key"]: i for i, s in enumerate(CHAT_PROGRESS_STAGES)}
@@ -326,6 +328,7 @@ def build_chat_progress_blocks(
     store_name: str,
     current_stage: str,
     extra_info: str = "",
+    lang: str = "en",
 ) -> list[dict]:
     """构建 Chat 模式的实时进度消息（单条消息动态更新）"""
     current_idx = _CHAT_STAGE_INDEX.get(current_stage, 0)
@@ -335,22 +338,24 @@ def build_chat_progress_blocks(
         if stage["key"] == "rewrite" and current_stage != "rewrite":
             continue
 
+        label = t(stage["i18n_key"], lang)
         if i < current_idx:
-            lines.append(f":white_check_mark:  {stage['label']}")
+            lines.append(f":white_check_mark:  {label}")
         elif i == current_idx:
-            lines.append(f"{stage['emoji']}  *{stage['label']}...*")
+            lines.append(f"{stage['emoji']}  *{label}...*")
         else:
-            lines.append(f":white_circle:  {stage['label']}")
+            lines.append(f":white_circle:  {label}")
 
     progress_text = "\n".join(lines)
     extra_line = f"\n\n:bulb: _{extra_info}_" if extra_info else ""
+    header = t("generating_for", lang, name=store_name)
 
     return [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f":rocket: *Generating blog for {store_name}*\n\n{progress_text}{extra_line}",
+                "text": f":rocket: *{header}*\n\n{progress_text}{extra_line}",
             },
         },
     ]
@@ -358,18 +363,18 @@ def build_chat_progress_blocks(
 
 # ── Auto 模式进度阶段 ─────────────────────────────────────
 PROGRESS_STAGES = [
-    {"key": "scrape",    "emoji": ":mag:",                   "label": "Scraping trending keywords"},
-    {"key": "research",  "emoji": ":brain:",                 "label": "Analyzing SEO opportunities"},
-    {"key": "template",  "emoji": ":art:",                   "label": "Selecting template & layout"},
-    {"key": "web",       "emoji": ":globe_with_meridians:",  "label": "Researching competitor articles"},
-    {"key": "write",     "emoji": ":pencil:",                "label": "Writing blog content"},
-    {"key": "review",    "emoji": ":eyes:",                  "label": "Reviewing content quality"},
-    {"key": "rewrite",   "emoji": ":memo:",                  "label": "Revising based on feedback"},
-    {"key": "artist",    "emoji": ":lower_left_paintbrush:", "label": "Enhancing image prompts"},
-    {"key": "image",     "emoji": ":camera:",                "label": "Generating images (Seedream)"},
-    {"key": "render",    "emoji": ":package:",               "label": "Assembling final HTML"},
-    {"key": "publish",   "emoji": ":outbox_tray:",           "label": "Publishing to WordPress"},
-    {"key": "done",      "emoji": ":white_check_mark:",      "label": "Complete!"},
+    {"key": "scrape",    "emoji": ":mag:",                   "i18n_key": "stage_scrape"},
+    {"key": "research",  "emoji": ":brain:",                 "i18n_key": "stage_research"},
+    {"key": "template",  "emoji": ":art:",                   "i18n_key": "stage_template"},
+    {"key": "web",       "emoji": ":globe_with_meridians:",  "i18n_key": "stage_web"},
+    {"key": "write",     "emoji": ":pencil:",                "i18n_key": "stage_write"},
+    {"key": "review",    "emoji": ":eyes:",                  "i18n_key": "stage_review"},
+    {"key": "rewrite",   "emoji": ":memo:",                  "i18n_key": "stage_rewrite"},
+    {"key": "artist",    "emoji": ":lower_left_paintbrush:", "i18n_key": "stage_artist"},
+    {"key": "image",     "emoji": ":camera:",                "i18n_key": "stage_image_gen"},
+    {"key": "render",    "emoji": ":package:",               "i18n_key": "stage_render_html"},
+    {"key": "publish",   "emoji": ":outbox_tray:",           "i18n_key": "stage_publish"},
+    {"key": "done",      "emoji": ":white_check_mark:",      "i18n_key": "stage_done"},
 ]
 
 _STAGE_INDEX = {s["key"]: i for i, s in enumerate(PROGRESS_STAGES)}
@@ -382,39 +387,33 @@ def build_progress_blocks(
     post_total: int = 1,
     extra_info: str = "",
     auto_publish: bool = True,
+    lang: str = "en",
 ) -> list[dict]:
-    """构建实时进度更新消息
-
-    Args:
-        merchant_name: 商家名称
-        current_stage: 当前阶段 key（如 "scrape", "write", "review"）
-        post_index: 当前第几篇（1-based）
-        post_total: 总篇数
-        extra_info: 额外信息（如选中的主题名、审核轮次等）
-        auto_publish: 是否自动发布到 WordPress（False 时隐藏 publish 阶段）
-    """
+    """构建实时进度更新消息"""
     current_idx = _STAGE_INDEX.get(current_stage, 0)
 
     lines = []
     for i, stage in enumerate(PROGRESS_STAGES):
         if stage["key"] == "rewrite" and current_stage != "rewrite":
-            continue  # 没有重写时跳过显示
+            continue
         if stage["key"] == "publish" and not auto_publish:
-            continue  # 手动模式下不显示 publish 阶段
+            continue
 
+        label = t(stage["i18n_key"], lang)
         if i < current_idx:
-            lines.append(f":white_check_mark:  {stage['label']}")
+            lines.append(f":white_check_mark:  {label}")
         elif i == current_idx:
-            lines.append(f"{stage['emoji']}  *{stage['label']}...*")
+            lines.append(f"{stage['emoji']}  *{label}...*")
         else:
-            lines.append(f":white_circle:  {stage['label']}")
+            lines.append(f":white_circle:  {label}")
 
     progress_text = "\n".join(lines)
+    gen_text = t("generating_for", lang, name=merchant_name)
 
     header = (
-        f":rocket: *Generating blog for {merchant_name}*"
+        f":rocket: *{gen_text}*"
         if post_total == 1
-        else f":rocket: *Generating blog {post_index}/{post_total} for {merchant_name}*"
+        else f":rocket: *{gen_text} ({post_index}/{post_total})*"
     )
 
     extra_line = f"\n\n:bulb: _{extra_info}_" if extra_info else ""
@@ -433,62 +432,15 @@ def build_progress_blocks(
 # ── Chat 对话模式专用消息构建 ────────────────────────────────
 
 
-def build_chat_result_blocks(result: dict) -> list[dict]:
-    """构建 Chat 对话模式的博客生成结果消息
-
-    与 auto 模式的 build_blog_result_blocks 类似，但增加了:
-    - Publish + Regenerate 按钮（在 thread 内交互）
-    - 不显示批量编号（chat 一次只生成一篇）
-    - 用户也可以直接在 thread 里打字提修改意见
-
-    Args:
-        result: pipeline 返回的结果字典
-                示例: {
-                    "success": True,
-                    "title": "Ultimate Guide to Tesla PPF",
-                    "preview_url": "http://localhost:8900/thouseirvine/xxx.html",
-                    "blog_data": {"title": "...", "excerpt": "...", "tags": [...], ...},
-                    "review_score": 88,
-                    "review_rounds": 2,
-                    "session_id": "chat_thouseirvine_1712100000_abc123",
-                    "usage_report": "...",
-                    "generation_time": "45s",
-                    "template_name": "Classic White",
-                    "layout_label": "How-To Guide",
-                }
-
-    Returns:
-        Slack Block Kit blocks 列表，包含:
-        - 标题 + 摘要
-        - SEO 信息
-        - 审核评分 + 模板/布局
-        - 预览链接
-        - Publish + Regenerate 按钮
-
-    输出示例（渲染效果）:
-        ┌─────────────────────────────────────────┐
-        │ 📓 Blog Generated via Chat               │
-        │                                          │
-        │ **Ultimate Guide to Tesla PPF**          │
-        │ _Protect your Tesla with XPEL PPF..._    │
-        │                                          │
-        │ ✅ Review: 88/100 (round 2)              │
-        │ 🏷️ Tags: PPF  Tesla  PaintProtection     │
-        │ 🎨 Template: Classic White               │
-        │ ⏱️ Time: 45s                             │
-        │                                          │
-        │ 👀 [Open Preview in Browser]             │
-        │                                          │
-        │ [📤 Publish to WordPress] [🔄 Regenerate] │
-        └─────────────────────────────────────────┘
-    """
+def build_chat_result_blocks(result: dict, lang: str = "en") -> list[dict]:
+    """构建 Chat 对话模式的博客生成结果消息"""
     if not result.get("success"):
         return [
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f":x: *Blog Generation Failed*\n\n"
+                    "text": f":x: *{t('blog_failed', lang)}*\n\n"
                             f"Error: {result.get('error', 'Unknown error')}",
                 },
             },
@@ -507,7 +459,7 @@ def build_chat_result_blocks(result: dict) -> list[dict]:
     gen_time = result.get("generation_time", "N/A")
     session_id = result.get("session_id", "")
 
-    tags_text = "  ".join(f"`{t}`" for t in tags[:5]) if tags else "N/A"
+    tags_text = "  ".join(f"`{tag}`" for tag in tags[:5]) if tags else "N/A"
 
     if score >= 90:
         score_emoji = ":star2:"
@@ -516,12 +468,9 @@ def build_chat_result_blocks(result: dict) -> list[dict]:
     else:
         score_emoji = ":warning:"
 
-    # 图片数量
     image_count = len(result.get("image_paths", {}))
-
-    # 评分条（视觉化）
-    filled = round(score / 10)
-    bar = ":large_green_square:" * filled + ":white_large_square:" * (10 - filled)
+    img_unit = t("images_plural", lang) if image_count > 1 else t("images", lang)
+    round_unit = t("rounds", lang) if rounds > 1 else t("round", lang)
 
     blocks = [
         # ── 标题 ──
@@ -529,7 +478,7 @@ def build_chat_result_blocks(result: dict) -> list[dict]:
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": ":sparkles: Blog Ready for Review",
+                "text": f":sparkles: {t('blog_ready', lang)}",
             },
         },
         # ── 博客标题 + 摘要 ──
@@ -546,10 +495,7 @@ def build_chat_result_blocks(result: dict) -> list[dict]:
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": (
-                    f"{score_emoji} *Review Score:*  *{score}/100*  ({rounds} round{'s' if rounds > 1 else ''})\n"
-                    f"{bar}"
-                ),
+                "text": f"{score_emoji} *{t('review_score', lang)}:*  *{score}/100*  ({rounds} {round_unit})",
             },
         },
         # ── 内容详情 ──
@@ -558,63 +504,87 @@ def build_chat_result_blocks(result: dict) -> list[dict]:
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f":label: *Tags:*  {tags_text}\n"
-                    f":frame_with_picture: *Images:*  {image_count} image{'s' if image_count > 1 else ''}\n"
-                    f":art: *Template:*  {template_name}  |  :page_facing_up: *Layout:*  {layout_label}\n"
-                    f":stopwatch: *Time:*  {gen_time}"
+                    f":label: *{t('tags', lang)}:*  {tags_text}\n"
+                    f":frame_with_picture: *{'图片' if lang == 'zh' else 'Images'}:*  {image_count} {img_unit}\n"
+                    f":art: *{t('template', lang)}:*  {template_name}  |  :page_facing_up: *{t('layout', lang)}:*  {layout_label}\n"
+                    f":stopwatch: *{t('time', lang)}:*  {gen_time}"
                 ),
             },
         },
-        {"type": "divider"},
-        # ── 预览链接 ──
-        {
+    ]
+
+    # ── 用量信息（紧跟详情） ──
+    if usage:
+        blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f":eyes:  *<{preview_url}|Open Preview in Browser>*",
+                "text": f":bar_chart: *{t('cost', lang)}:*  {usage}",
             },
-        },
-        # ── 提示 ──
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": ":speech_balloon: _Reply in this thread to request changes, or use the buttons below._",
-                },
-            ],
-        },
-    ]
+        })
 
-    # ── 操作按钮 ──
+    blocks.append({"type": "divider"})
+
+    # ── 预览 + 提示 + 按钮（底部一组） ──
+    blocks.append({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": f":eyes:  *<{preview_url}|:point_right: {t('open_preview', lang)}>*",
+        },
+    })
+    blocks.append({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": f":speech_balloon: *{t('reply_hint', lang)}*",
+        },
+    })
     blocks.append({
         "type": "actions",
         "elements": [
             {
                 "type": "button",
-                "text": {"type": "plain_text", "text": ":outbox_tray: Publish to WordPress"},
+                "text": {"type": "plain_text", "text": f":outbox_tray: {t('publish_wp', lang)}"},
                 "style": "primary",
                 "action_id": f"wp_publish_{session_id}",
             },
             {
                 "type": "button",
-                "text": {"type": "plain_text", "text": ":arrows_counterclockwise: Regenerate"},
+                "text": {"type": "plain_text", "text": f":arrows_counterclockwise: {t('regenerate', lang)}"},
                 "action_id": f"chat_regenerate_{session_id}",
             },
         ],
     })
 
-    # ── 用量信息 ──
-    if usage:
-        blocks.append({"type": "divider"})
-        blocks.append({
-            "type": "context",
+    return blocks
+
+
+def build_confirm_blocks(summary_text: str, lang: str = "en") -> list[dict]:
+    """构建 Chat 模式的参数确认消息 — 用户确认后才开始生成"""
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": summary_text,
+            },
+        },
+        {"type": "divider"},
+        {
+            "type": "actions",
             "elements": [
                 {
-                    "type": "mrkdwn",
-                    "text": f":bar_chart: *Cost:*  {usage}",
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": f":white_check_mark: {t('confirm_generate', lang)}"},
+                    "style": "primary",
+                    "action_id": "chat_confirm_generate",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": f":pencil2: {t('confirm_edit', lang)}"},
+                    "action_id": "chat_confirm_edit",
                 },
             ],
-        })
-
-    return blocks
+        },
+    ]
