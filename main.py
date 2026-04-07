@@ -47,7 +47,8 @@ import scheduler
 from core.merchant_config import load_all_merchants, get_merchant_by_channel
 from core.channel_router import parse_auto_command
 from core import session as chat_session
-from core.session import GATHERING, GENERATING, REVIEWING, DONE
+from core.session import GATHERING, CONFIRMING, GENERATING, REVIEWING, DONE
+from core.i18n import t, detect_language
 from agents.conversation import chat_and_maybe_generate
 from pipeline.blog_generator import generate_multiple_blogs
 from pipeline.preview_server import start_preview_server
@@ -195,13 +196,20 @@ def _start_chat_session(event: dict, text: str, message_ts: str, channel: str, s
     sess = chat_session.get_or_create(message_ts, channel)
     log.info("[%s] 新 Chat 会话: thread=%s user=%s", merchant_id, message_ts, event.get("user", ""))
 
+    # 检测语言（首条消息时）
+    if text and sess.get("language", "en") == "en":
+        detected = detect_language(text)
+        if detected == "zh":
+            sess["language"] = "zh"
+
     # 下载用户上传的图片（如果有）
     new_images = _download_event_images(event, message_ts, client)
     if new_images:
+        lang = sess.get("language", "en")
         total = len(chat_session.get(message_ts).get("user_images", []))
         img_lines = "\n".join(f":frame_with_picture: Image {total - len(new_images) + i + 1}: `{name}`"
                               for i, name in enumerate(new_images))
-        say(text=f":white_check_mark: *Received {len(new_images)} image(s)* (total: {total})\n{img_lines}",
+        say(text=f":white_check_mark: *{t('received_images', lang, count=len(new_images))}* ({t('total_images', lang, total=total)})\n{img_lines}",
             thread_ts=message_ts)
 
     # 记录用户消息到会话历史
@@ -250,13 +258,20 @@ def _handle_chat_message(event: dict, sess: dict, text: str, say, client):
         return
     merchant_id = merchant_cfg["merchant_id"]
 
+    # 检测语言
+    if text and sess.get("language", "en") == "en":
+        detected = detect_language(text)
+        if detected == "zh":
+            sess["language"] = "zh"
+    lang = sess.get("language", "en")
+
     # 下载用户上传的图片
     new_images = _download_event_images(event, thread_ts, client)
     if new_images:
         total = len(sess.get("user_images", []))
         img_lines = "\n".join(f":frame_with_picture: Image {total - len(new_images) + i + 1}: `{name}`"
                               for i, name in enumerate(new_images))
-        say(text=f":white_check_mark: *Received {len(new_images)} image(s)* (total: {total})\n{img_lines}",
+        say(text=f":white_check_mark: *{t('received_images', lang, count=len(new_images))}* ({t('total_images', lang, total=total)})\n{img_lines}",
             thread_ts=thread_ts)
 
     # 包装 say 函数，自动加 thread_ts
@@ -276,9 +291,22 @@ def _handle_chat_message(event: dict, sess: dict, text: str, say, client):
             daemon=True,
         ).start()
 
+    elif stage == CONFIRMING:
+        # 确认阶段 — 用户打字修改（回到 GATHERING 重新对话）
+        if text:
+            chat_session.update_stage(thread_ts, GATHERING)
+            chat_session.add_message(thread_ts, "user", text)
+            threading.Thread(
+                target=_safe_run,
+                args=(chat_and_maybe_generate, sess, text, _thread_say, client, merchant_id, merchant_cfg),
+                daemon=True,
+            ).start()
+        else:
+            _thread_say(text=t("confirm_or_adjust", lang))
+
     elif stage == GENERATING:
         # 正在生成 — 告知等待
-        _thread_say(text="Still generating, please wait... :hourglass_flowing_sand:")
+        _thread_say(text=f"{t('still_generating', lang)} :hourglass_flowing_sand:")
 
     elif stage == REVIEWING:
         # 审核阶段 — 用户打字提修改意见（回到 GATHERING，GPT 提取 modify_scope）
@@ -291,7 +319,7 @@ def _handle_chat_message(event: dict, sess: dict, text: str, say, client):
                 daemon=True,
             ).start()
         else:
-            _thread_say(text="Click a button above, or tell me what you'd like to change.")
+            _thread_say(text=t("click_or_change", lang))
 
     elif stage == DONE:
         # 已完成 — 新一轮对话
@@ -382,6 +410,68 @@ def _fetch_files_from_api(client, channel: str, ts: str) -> list:
 #  Chat 按钮交互处理
 # ══════════════════════════════════════════════════════════
 
+@app.action("chat_confirm_generate")
+def handle_chat_confirm_generate(ack, body, say, client) -> None:
+    """用户确认参数，开始生成博客"""
+    ack()
+    thread_ts = _get_thread_ts_from_body(body)
+    channel = body.get("channel", {}).get("id", "")
+    if not thread_ts:
+        return
+
+    sess = chat_session.get(thread_ts)
+    if not sess:
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=t("session_expired", "en"),
+        )
+        return
+
+    merchant_cfg = get_merchant_by_channel(channel)
+    if not merchant_cfg:
+        return
+    merchant_id = merchant_cfg["merchant_id"]
+
+    lang = sess.get("language", "en")
+    chat_session.update_stage(thread_ts, GENERATING)
+    client.chat_postMessage(
+        channel=channel, thread_ts=thread_ts,
+        text=f":rocket: {t('starting_generation', lang)}",
+    )
+
+    def _thread_say(**kwargs):
+        kwargs.setdefault("thread_ts", thread_ts)
+        return say(**kwargs)
+
+    from pipeline.chat_generator import run_chat_pipeline
+    threading.Thread(
+        target=_safe_run,
+        args=(run_chat_pipeline, sess, merchant_id, merchant_cfg, _thread_say, client),
+        daemon=True,
+    ).start()
+
+
+@app.action("chat_confirm_edit")
+def handle_chat_confirm_edit(ack, body, client) -> None:
+    """用户想继续调整参数，回到 GATHERING 状态"""
+    ack()
+    thread_ts = _get_thread_ts_from_body(body)
+    channel = body.get("channel", {}).get("id", "")
+    if not thread_ts:
+        return
+
+    sess = chat_session.get(thread_ts)
+    if not sess:
+        return
+
+    lang = sess.get("language", "en")
+    chat_session.update_stage(thread_ts, GATHERING)
+    client.chat_postMessage(
+        channel=channel, thread_ts=thread_ts,
+        text=f":pencil2: {t('no_problem_adjust', lang)}",
+    )
+
+
 @app.action(re.compile(r"^chat_regenerate_"))
 def handle_chat_regenerate(ack, body, say, client) -> None:
     """处理 Chat 模式的 Regenerate（重新生成）按钮
@@ -398,10 +488,11 @@ def handle_chat_regenerate(ack, body, say, client) -> None:
     if not sess:
         client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
-            text="Session expired. Please start a new conversation.",
+            text=t("session_expired", "en"),
         )
         return
 
+    lang = sess.get("language", "en")
     merchant_cfg = get_merchant_by_channel(channel)
     if not merchant_cfg:
         return
@@ -410,7 +501,7 @@ def handle_chat_regenerate(ack, body, say, client) -> None:
     chat_session.update_stage(thread_ts, GENERATING)
     client.chat_postMessage(
         channel=channel, thread_ts=thread_ts,
-        text=":arrows_counterclockwise: Regenerating blog from scratch...",
+        text=f":arrows_counterclockwise: {t('regenerating', lang)}",
     )
 
     def _thread_say(**kwargs):

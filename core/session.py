@@ -2,9 +2,10 @@
 
 状态机（与 auto 流程完全隔离，仅用于 @Bot chat / 自由对话）：
 
-  GATHERING  →  GENERATING  →  REVIEWING  →  DONE
-       ^                                      |
-       └──────────────────────────────────────┘  (用户要求修改时回到 GATHERING)
+  GATHERING  →  CONFIRMING  →  GENERATING  →  REVIEWING  →  DONE
+       ^            |                                        |
+       │            └── (用户继续修改 → 回到 GATHERING)        │
+       └─────────────────────────────────────────────────────┘  (用户要求修改时回到 GATHERING)
 
 每个会话存储：
   - 对话历史 messages[]            给 GPT 做上下文理解
@@ -44,6 +45,7 @@ _sessions: dict[str, dict] = {}
 
 # ── 会话状态常量 ──────────────────────────────────────────
 GATHERING = "gathering_info"   # 正在收集信息（对话中）
+CONFIRMING = "confirming"      # 参数确认中，等待用户点 Confirm 或继续修改
 GENERATING = "generating"      # 正在调用 pipeline 生成博客
 REVIEWING = "reviewing"        # 生成完毕，等待用户审核/修改
 DONE = "done"                  # 本轮完成（用户满意或已发布）
@@ -93,6 +95,7 @@ def get_or_create(thread_ts: str, channel: str) -> dict:
                                           # 示例: {"img_2": "夕阳下Tesla侧面施工特写，暖色调",
                                           #         "img_4": "价格对比图，简洁风格"}
                 "user_images": [],        # 用户上传的图片本地路径列表
+                "language": "en",         # 用户语言（"zh" 或 "en"），根据首条消息自动检测
                 "draft": {},              # 当前草稿: {"result": pipeline 返回的 dict, "session_id": "..."}
                 "usage": {                # 本次会话的 token 用量统计
                     "prompt_tokens": 0,

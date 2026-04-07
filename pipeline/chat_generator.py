@@ -68,6 +68,7 @@ from agents.reviewer import review_blog
 from agents.artist import enhance_image_prompts
 from core import session
 from core.session import REVIEWING
+from core.i18n import t
 from pipeline.preview_server import render_blog_html
 from pipeline.web_researcher import research_topic
 from services.template_selector import pick_template_and_layout
@@ -123,6 +124,7 @@ def run_chat_pipeline(
     creative_brief = sess.get("creative_brief", {})
     user_image_requests = sess.get("user_image_requests", {})
     store_name = merchant_cfg.get("store_name", merchant_id)
+    lang = sess.get("language", "en")
 
     session_id = f"chat_{merchant_id}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
     set_current_session(session_id)
@@ -134,23 +136,24 @@ def run_chat_pipeline(
 
     # ── 进度消息（单条消息动态更新，和 auto 模式一样）──
     _progress_ts = None
+    _fallback_text = t("generating_for", lang, name=store_name)
 
     def _progress(stage_key: str, extra: str = ""):
         """更新进度消息（首次发送，后续 chat_update 覆盖同一条）"""
         nonlocal _progress_ts
-        blocks = build_chat_progress_blocks(store_name, stage_key, extra)
+        blocks = build_chat_progress_blocks(store_name, stage_key, extra, lang=lang)
         try:
             if _progress_ts is None:
                 resp = client.chat_postMessage(
                     channel=channel, thread_ts=thread_ts,
-                    text=f"Generating blog for {store_name}...",
+                    text=_fallback_text,
                     blocks=blocks,
                 )
                 _progress_ts = resp["ts"]
             else:
                 client.chat_update(
                     channel=channel, ts=_progress_ts,
-                    text=f"Generating blog for {store_name}...",
+                    text=_fallback_text,
                     blocks=blocks,
                 )
         except Exception:
@@ -164,7 +167,7 @@ def run_chat_pipeline(
         if modify_scope and not sess["draft"]:
             # 用户请求修改但没有草稿 — 清除 modify 参数，走正常生成
             log.warning("[%s][chat] 收到修改请求但无草稿，转为正常生成", merchant_id)
-            say(text="No existing draft to modify — generating a new blog instead.",
+            say(text=t("no_draft_to_modify", lang),
                 thread_ts=thread_ts)
             params.pop("modify_scope", None)
             params.pop("modify_feedback", None)
@@ -291,7 +294,7 @@ def run_chat_pipeline(
 
         # ── 发送结果到 Slack ──────────────────────────────────
         from slack_ui.blocks import build_chat_result_blocks
-        blocks = build_chat_result_blocks(result)
+        blocks = build_chat_result_blocks(result, lang=lang)
         client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
@@ -304,7 +307,7 @@ def run_chat_pipeline(
     except Exception as exc:
         log.exception("[%s][chat] Pipeline 失败: %s", merchant_id, exc)
         session.update_stage(thread_ts, session.GATHERING if not sess["draft"] else REVIEWING)
-        say(text=f":x: Blog generation failed: {exc}\n\nPlease try again or adjust your request.",
+        say(text=f":x: {t('gen_failed', lang, error=str(exc))}",
             thread_ts=thread_ts)
 
     finally:
@@ -793,7 +796,8 @@ def _run_modification(
     prev_result = sess["draft"].get("result", {})
     prev_blog_data = prev_result.get("blog_data", {})
 
-    say(text="Working on your modifications...", thread_ts=thread_ts)
+    lang = sess.get("language", "en")
+    say(text=t("working_on_mods", lang), thread_ts=thread_ts)
 
     blog_data = dict(prev_blog_data)  # 浅复制，避免修改原数据
 
@@ -888,6 +892,7 @@ def _run_modification(
         "title": blog_data.get("title", "Untitled"),
         "preview_url": preview_url,
         "blog_data": blog_data,
+        "image_paths": {slot: str(p) for slot, p in image_paths.items()},
         "review_score": prev_result.get("review_score", 0),
         "review_rounds": 0,
         "session_id": session_id,
@@ -905,7 +910,7 @@ def _run_modification(
     session.update_stage(thread_ts, REVIEWING)
 
     from slack_ui.blocks import build_chat_result_blocks
-    blocks = build_chat_result_blocks(result)
+    blocks = build_chat_result_blocks(result, lang=lang)
     client.chat_postMessage(
         channel=channel,
         thread_ts=thread_ts,
