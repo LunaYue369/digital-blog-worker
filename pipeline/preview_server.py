@@ -68,44 +68,33 @@ def render_blog_html(
     store_name = merchant_cfg.get("store_name", "Blog")
     website = merchant_cfg.get("website", "#")
 
-    # 图片处理 — 嵌入 data URI 或留空
-    hero_uri = _image_to_data_uri(image_paths.get("hero")) if image_paths.get("hero") else ""
-    mid_uri = _image_to_data_uri(image_paths.get("mid")) if image_paths.get("mid") else ""
-    end_uri = _image_to_data_uri(image_paths.get("end")) if image_paths.get("end") else ""
-
-    # Copywriter 提供的 SEO alt text（没有就用默认值）
+    # 图片处理 — 遍历所有槽位（兼容 hero/mid/end 和 img_1/img_2/.../img_N）
     image_alts = blog_data.get("image_alts", {})
-    hero_alt = image_alts.get("hero", title)
-    mid_alt = image_alts.get("mid", f"{title} - detail")
-    end_alt = image_alts.get("end", f"{title} - service")
 
-    # 替换内容中的图片占位符（有图嵌入，无图删除占位符）
-    if hero_uri:
-        content_html = content_html.replace(
-            "<!-- BLOG_IMAGE:hero -->",
-            f'<div class="blog-image hero-inline"><img src="{hero_uri}" alt="{hero_alt}" loading="eager"></div>'
-        )
-    else:
-        content_html = content_html.replace("<!-- BLOG_IMAGE:hero -->", "")
+    for slot, img_path in image_paths.items():
+        placeholder = f"<!-- BLOG_IMAGE:{slot} -->"
+        if img_path and Path(img_path).exists():
+            data_uri = _image_to_data_uri(Path(img_path))
+            alt = image_alts.get(slot, f"{title} - {slot}")
+            # 第一张图用 eager loading，其余用 lazy
+            loading = "eager" if slot in ("hero", "img_1") else "lazy"
+            css_class = f"blog-image {slot}-image"
+            replacement = f'<div class="{css_class}"><img src="{data_uri}" alt="{alt}" loading="{loading}"></div>'
+            # 只替换第一个占位符（防止 copywriter 重复放同一个占位符导致图片出现两次）
+            content_html = content_html.replace(placeholder, replacement, 1)
+            # 清掉同一 slot 的多余占位符
+            content_html = content_html.replace(placeholder, "")
+        else:
+            content_html = content_html.replace(placeholder, "")
 
-    if mid_uri:
-        content_html = content_html.replace(
-            "<!-- BLOG_IMAGE:mid -->",
-            f'<div class="blog-image mid-image"><img src="{mid_uri}" alt="{mid_alt}" loading="lazy"></div>'
-        )
-    else:
-        content_html = content_html.replace("<!-- BLOG_IMAGE:mid -->", "")
+    # 清理未被替换的占位符（图片缺失时）
+    content_html = re.sub(r"<!-- BLOG_IMAGE:\w+ -->", "", content_html)
 
-    if end_uri:
-        content_html = content_html.replace(
-            "<!-- BLOG_IMAGE:end -->",
-            f'<div class="blog-image end-image"><img src="{end_uri}" alt="{end_alt}" loading="lazy"></div>'
-        )
-    else:
-        content_html = content_html.replace("<!-- BLOG_IMAGE:end -->", "")
+    # hero 背景改为品牌渐变，不再需要 HERO_IMAGE 变量
+    hero_uri = ""
 
     # 安全网：Copywriter 偶尔编造 <img src="/images/xxx.jpg"> 假标签，直接删掉
-    # （真图已通过占位符或模板 {{HERO_IMAGE}} 嵌入，不需要重复）
+    # （真图已通过占位符嵌入，不需要重复）
     fake_img_pattern = re.compile(r'<img\s+[^>]*src="(/images/[^"]+)"[^>]*/?\s*>')
     content_html, fake_count = fake_img_pattern.subn("", content_html)
     if fake_count:

@@ -65,6 +65,18 @@ def init(slack_client) -> None:
     _scheduler.start()
     log.info("调度器已启动 (timezone=%s)", cfg.TIMEZONE)
 
+    # 每小时清理超过 24 小时的旧 chat session，防止内存泄漏
+    from core.session import cleanup_old
+    _scheduler.add_job(
+        cleanup_old,
+        trigger="interval",
+        hours=1,
+        id="session_cleanup",
+        kwargs={"max_age_hours": 24},
+        replace_existing=True,
+    )
+    log.info("已注册 session 清理任务: 每小时清理 >24h 的会话")
+
 
 # ── 定时任务回调（闹钟响了执行什么）──────────────────────
 

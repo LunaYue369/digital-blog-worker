@@ -4,19 +4,36 @@
 1. 加载所有商家配置和 Agent 人格
 2. 启动预览服务器（HTTP 静态文件服务）
 3. 启动 APScheduler 定时调度器
-4. 启动 Slack Bot（Socket Mode）监听各频道的 auto 指令
+4. 启动 Slack Bot（Socket Mode）监听各频道的指令
 
 一个 Bot 实例服务所有商家，通过频道 ID 区分。
 
-指令：
+两条独立的流程：
+1. Auto 流程（命令式，无状态）：
     auto 3         → 立即生成 3 篇博客供审核
     auto on        → 开启定时调度（使用默认时间点）
     auto on 09:00 14:00 18:00 → 开启定时调度（自定义时间点）
     auto off       → 关闭定时调度
     auto status    → 查看当前调度状态
+    publish        → 发布最近一篇草稿到 WordPress
+
+2. Chat 流程（对话式，有状态）：
+    任何非命令的 @mention → 进入对话模式（收集主题、关键词、图片等）
+    thread 内回复        → 继续对话 / 修改请求
+    支持用户上传图片作为博客配图
+
+路由逻辑：
+  用户消息进来
+      │
+      ├─ 是 thread 内回复 且 thread 有活跃会话 → Chat 对话流程
+      │
+      ├─ "@Bot auto ..."    → Auto 流程（完全不变）
+      │
+      └─ "@Bot 其他任何内容" → 新建 Chat 对话（替代原来的"显示帮助"）
 """
 
 import logging
+import os
 import re
 import sys
 import threading
@@ -29,8 +46,12 @@ import config as cfg
 import scheduler
 from core.merchant_config import load_all_merchants, get_merchant_by_channel
 from core.channel_router import parse_auto_command
+from core import session as chat_session
+from core.session import GATHERING, GENERATING, REVIEWING, DONE
+from agents.conversation import chat_and_maybe_generate
 from pipeline.blog_generator import generate_multiple_blogs
 from pipeline.preview_server import start_preview_server
+from services.image_downloader import download_slack_file
 from slack_ui.blocks import (
     build_batch_summary_blocks,
     build_schedule_status_blocks,
@@ -57,25 +78,70 @@ app = App(token=cfg.SLACK_BOT_TOKEN)
 # Bot 自身的 user_id（用于过滤自己的消息，防止回环）
 _bot_user_id: str = ""
 
+# 已处理的消息 ts 集合 — 防止 message + app_mention 双重触发
+# 只保留最近 200 条，避免内存泄漏
+_processed_events: set[str] = set()
+_processed_events_list: list[str] = []  # 保持插入顺序用于清理
 
-# ── 消息事件处理 ──────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════
+#  消息事件处理 — 统一入口，路由到 Auto / Chat
+# ══════════════════════════════════════════════════════════
 
 @app.event("message")
 def handle_message(event: dict, say, client) -> None:
-    """处理频道中的消息 — 只响应 @mention 的 auto 指令"""
-    # 过滤 Bot 自身消息
+    """处理频道中的消息 — 路由到 Auto 命令流程或 Chat 对话流程
+
+    路由规则（按优先级）：
+    1. 过滤 Bot 自身消息 + 子类型消息
+    2. 如果是 thread 内回复 且 thread 有活跃 chat 会话 → Chat 对话流程
+    3. 如果 @mention 了 Bot:
+       a. "auto ..."  → Auto 流程
+       b. 其他文字    → 新建 Chat 对话
+    4. 如果没有 @mention 且不在 chat thread 内 → 忽略
+    """
+    # ── 去重 — 防止 message + app_mention 重复处理 ──
+    event_ts = event.get("ts", "")
+    if event_ts in _processed_events:
+        return
+    _processed_events.add(event_ts)
+    _processed_events_list.append(event_ts)
+    # 清理旧记录，保留最近 200 条
+    while len(_processed_events_list) > 200:
+        old_ts = _processed_events_list.pop(0)
+        _processed_events.discard(old_ts)
+
+    # ── 调试日志 — 查看每条进来的消息 ──
     user = event.get("user", "")
+    subtype = event.get("subtype")
+    log.info("收到消息事件: user=%s subtype=%s thread_ts=%s ts=%s files=%s text=%s",
+             user, subtype, event.get("thread_ts"), event.get("ts"),
+             [f.get("name") for f in event.get("files", [])],
+             (event.get("text") or "")[:80])
+
+    # ── 过滤 Bot 自身消息 ──
     if user == _bot_user_id:
         return
 
-    # 过滤子类型消息（编辑、删除等）
-    if event.get("subtype"):
+    # ── 过滤子类型消息（编辑、删除等，但保留 file_share 因为用户可能只上传图片无文字） ──
+    if subtype and subtype not in ("file_share",):
         return
 
     text = event.get("text", "").strip()
     channel = event.get("channel", "")
+    thread_ts = event.get("thread_ts")  # 如果是 thread 回复，这里有值
+    message_ts = event.get("ts", "")    # 消息自身的 timestamp
 
-    # 必须 @mention Bot 才响应
+    # ── 检查是否在活跃的 chat 会话 thread 内 ──
+    # 如果用户在一个已有 chat 会话的 thread 里回复，直接走 Chat 流程
+    # 不需要 @mention（thread 内对话自然延续）
+    if thread_ts:
+        existing_session = chat_session.get(thread_ts)
+        if existing_session:
+            _handle_chat_message(event, existing_session, text, say, client)
+            return
+
+    # ── 必须 @mention Bot 才响应（非 thread 内的新消息） ──
     if f"<@{_bot_user_id}>" not in text:
         return
 
@@ -87,22 +153,307 @@ def handle_message(event: dict, say, client) -> None:
         _handle_publish(text, channel, say, client)
         return
 
-    # 检查是否是 auto 指令
+    # ── 检查 auto 指令 ──
     cmd = parse_auto_command(text)
-    if cmd is None:
-        # @mention 了但不是 auto 指令 → 显示帮助
-        say(
-            ":wave: Hi! Here's how to use me:\n\n"
-            f"• `@bot auto 3` — Generate 3 blog posts now\n"
-            f"• `@bot auto on` — Start daily scheduled generation\n"
-            f"• `@bot auto on 09:00 14:00` — Schedule at custom times\n"
-            f"• `@bot auto off` — Stop scheduled generation\n"
-            f"• `@bot auto status` — Check schedule & recent posts\n"
-            f"• `@bot publish` — Publish latest draft to WordPress (private)"
+    if cmd is not None:
+        # 是 auto 指令 → 走原有的 Auto 流程（完全不变）
+        _handle_auto_command(cmd, channel, user, say, client)
+        return
+
+    # ── 不是 auto/publish → 进入 Chat 对话流程 ──
+    # 用消息自身的 ts 作为 thread_ts（新开一个 thread）
+    _start_chat_session(event, text, message_ts, channel, say, client)
+
+
+# ══════════════════════════════════════════════════════════
+#  Chat 对话流程
+# ══════════════════════════════════════════════════════════
+
+def _start_chat_session(event: dict, text: str, message_ts: str, channel: str, say, client):
+    """开始一个新的 Chat 对话会话
+
+    当用户 @mention Bot 但不是 auto/publish 指令时触发。
+    创建新会话，下载图片（如果有），启动对话层。
+
+    Args:
+        event:      Slack 事件字典
+        text:       用户消息文本（已去掉 @mention）
+        message_ts: 消息时间戳（作为 thread 的起始 ts）
+        channel:    频道 ID
+        say:        Slack say 函数
+        client:     Slack WebClient
+    """
+    # 查找频道对应的商家
+    merchant_cfg = get_merchant_by_channel(channel)
+    if not merchant_cfg:
+        say(":warning: This channel is not linked to any merchant. Please check merchant configuration.")
+        return
+
+    merchant_id = merchant_cfg["merchant_id"]
+
+    # 创建新会话（用消息 ts 作为 thread_ts）
+    sess = chat_session.get_or_create(message_ts, channel)
+    log.info("[%s] 新 Chat 会话: thread=%s user=%s", merchant_id, message_ts, event.get("user", ""))
+
+    # 下载用户上传的图片（如果有）
+    new_images = _download_event_images(event, message_ts, client)
+    if new_images:
+        total = len(chat_session.get(message_ts).get("user_images", []))
+        img_lines = "\n".join(f":frame_with_picture: Image {total - len(new_images) + i + 1}: `{name}`"
+                              for i, name in enumerate(new_images))
+        say(text=f":white_check_mark: *Received {len(new_images)} image(s)* (total: {total})\n{img_lines}",
+            thread_ts=message_ts)
+
+    # 记录用户消息到会话历史
+    if text:
+        chat_session.add_message(message_ts, "user", text)
+
+    # 用后台线程启动对话层（避免阻塞 Slack 事件循环的 3 秒 ack 超时）
+    def _thread_say(**kwargs):
+        """包装 say 函数，自动加 thread_ts"""
+        kwargs.setdefault("thread_ts", message_ts)
+        return say(**kwargs)
+
+    threading.Thread(
+        target=_safe_run,
+        args=(chat_and_maybe_generate, sess, text, _thread_say, client, merchant_id, merchant_cfg),
+        daemon=True,
+        name=f"chat-{merchant_id}-{message_ts[:10]}",
+    ).start()
+
+
+def _handle_chat_message(event: dict, sess: dict, text: str, say, client):
+    """处理已有 Chat 会话 thread 内的消息
+
+    根据会话当前状态分发处理:
+    - GATHERING:  继续对话（收集信息）
+    - GENERATING: 告知用户等待
+    - REVIEWING:  用户打字修改意见 → 回到 GATHERING 处理
+    - DONE:       用户继续说话 → 开启新一轮
+
+    Args:
+        event: Slack 事件字典
+        sess:  已有的会话字典
+        text:  用户消息文本（原始，可能含 @mention）
+        say:   Slack say 函数
+        client: Slack WebClient
+    """
+    thread_ts = sess["thread_ts"]
+    channel = sess["channel"]
+
+    # 去掉 @mention（thread 内可能有也可能没有）
+    text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
+
+    # 查找商家
+    merchant_cfg = get_merchant_by_channel(channel)
+    if not merchant_cfg:
+        return
+    merchant_id = merchant_cfg["merchant_id"]
+
+    # 下载用户上传的图片
+    new_images = _download_event_images(event, thread_ts, client)
+    if new_images:
+        total = len(sess.get("user_images", []))
+        img_lines = "\n".join(f":frame_with_picture: Image {total - len(new_images) + i + 1}: `{name}`"
+                              for i, name in enumerate(new_images))
+        say(text=f":white_check_mark: *Received {len(new_images)} image(s)* (total: {total})\n{img_lines}",
+            thread_ts=thread_ts)
+
+    # 包装 say 函数，自动加 thread_ts
+    def _thread_say(**kwargs):
+        kwargs.setdefault("thread_ts", thread_ts)
+        return say(**kwargs)
+
+    stage = sess["stage"]
+
+    if stage == GATHERING:
+        # 对话中 — 继续收集信息
+        if text:
+            chat_session.add_message(thread_ts, "user", text)
+        threading.Thread(
+            target=_safe_run,
+            args=(chat_and_maybe_generate, sess, text, _thread_say, client, merchant_id, merchant_cfg),
+            daemon=True,
+        ).start()
+
+    elif stage == GENERATING:
+        # 正在生成 — 告知等待
+        _thread_say(text="Still generating, please wait... :hourglass_flowing_sand:")
+
+    elif stage == REVIEWING:
+        # 审核阶段 — 用户打字提修改意见（回到 GATHERING，GPT 提取 modify_scope）
+        if text:
+            chat_session.update_stage(thread_ts, GATHERING)
+            chat_session.add_message(thread_ts, "user", text)
+            threading.Thread(
+                target=_safe_run,
+                args=(chat_and_maybe_generate, sess, text, _thread_say, client, merchant_id, merchant_cfg),
+                daemon=True,
+            ).start()
+        else:
+            _thread_say(text="Click a button above, or tell me what you'd like to change.")
+
+    elif stage == DONE:
+        # 已完成 — 新一轮对话
+        chat_session.update_stage(thread_ts, GATHERING)
+        if text:
+            chat_session.add_message(thread_ts, "user", text)
+        threading.Thread(
+            target=_safe_run,
+            args=(chat_and_maybe_generate, sess, text, _thread_say, client, merchant_id, merchant_cfg),
+            daemon=True,
+        ).start()
+
+
+def _download_event_images(event: dict, thread_ts: str, client) -> list[str]:
+    """从 Slack 事件中下载用户上传的图片
+
+    Slack 的 message 事件中 files 字段包含上传的文件信息。
+    app_mention 事件可能不含 files，需要通过 API 补充获取。
+
+    Args:
+        event:     Slack 事件字典
+        thread_ts: 会话的 thread timestamp（图片关联到这个会话）
+        client:    Slack WebClient（用于 API 补充获取）
+
+    Returns:
+        本次新下载的原始文件名列表（用于确认消息）
+    """
+    token = cfg.SLACK_BOT_TOKEN
+    files = event.get("files", [])
+
+    # app_mention 事件可能不含 files，通过 API 补充
+    if not files:
+        files = _fetch_files_from_api(client, event.get("channel", ""), event.get("ts", ""))
+
+    # 用 Slack file ID 去重，防止 message + app_mention 双重下载
+    sess = chat_session.get(thread_ts)
+    downloaded_file_ids = set()
+    if sess:
+        downloaded_file_ids = sess.get("_downloaded_file_ids", set())
+
+    new_names: list[str] = []
+    for f in files:
+        file_id = f.get("id", "")
+        if f.get("mimetype", "").startswith("image/") and file_id not in downloaded_file_ids:
+            path = download_slack_file(f["url_private"], f["name"], token)
+            if path:
+                chat_session.add_user_image(thread_ts, path)
+                downloaded_file_ids.add(file_id)
+                new_names.append(f["name"])
+                log.info("已下载用户图片: %s → %s", f["name"], path)
+
+    if sess:
+        sess["_downloaded_file_ids"] = downloaded_file_ids
+
+    return new_names
+
+
+def _fetch_files_from_api(client, channel: str, ts: str) -> list:
+    """当事件中没有 files 时，通过 Slack API 获取消息附件
+
+    app_mention 事件通常不含 files 字段，需要用
+    conversations.replies 来获取用户上传的图片。
+
+    Args:
+        client:  Slack WebClient
+        channel: 频道 ID
+        ts:      消息时间戳
+
+    Returns:
+        文件列表（可能为空）
+    """
+    if not ts:
+        return []
+    try:
+        resp = client.conversations_replies(
+            channel=channel, ts=ts, limit=1, inclusive=True,
+        )
+        for msg in resp.get("messages", []):
+            if msg.get("ts") == ts and msg.get("files"):
+                log.info("通过 API 补充获取到 %d 个文件", len(msg["files"]))
+                return msg["files"]
+    except Exception as e:
+        log.warning("获取消息附件失败: %s", e)
+    return []
+
+
+# ══════════════════════════════════════════════════════════
+#  Chat 按钮交互处理
+# ══════════════════════════════════════════════════════════
+
+@app.action(re.compile(r"^chat_regenerate_"))
+def handle_chat_regenerate(ack, body, say, client) -> None:
+    """处理 Chat 模式的 Regenerate（重新生成）按钮
+
+    完全重新生成（不是修改），使用相同的参数重跑整个 pipeline。
+    """
+    ack()
+    thread_ts = _get_thread_ts_from_body(body)
+    channel = body.get("channel", {}).get("id", "")
+    if not thread_ts:
+        return
+
+    sess = chat_session.get(thread_ts)
+    if not sess:
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text="Session expired. Please start a new conversation.",
         )
         return
 
-    # 查找频道对应的商家
+    merchant_cfg = get_merchant_by_channel(channel)
+    if not merchant_cfg:
+        return
+    merchant_id = merchant_cfg["merchant_id"]
+
+    chat_session.update_stage(thread_ts, GENERATING)
+    client.chat_postMessage(
+        channel=channel, thread_ts=thread_ts,
+        text=":arrows_counterclockwise: Regenerating blog from scratch...",
+    )
+
+    def _thread_say(**kwargs):
+        kwargs.setdefault("thread_ts", thread_ts)
+        return say(**kwargs)
+
+    from pipeline.chat_generator import run_chat_pipeline
+    threading.Thread(
+        target=_safe_run,
+        args=(run_chat_pipeline, sess, merchant_id, merchant_cfg, _thread_say, client),
+        daemon=True,
+    ).start()
+
+
+def _get_thread_ts_from_body(body: dict) -> str | None:
+    """从 Slack action body 中提取 thread_ts
+
+    按钮消息可能在 thread 内也可能不在，需要从 message 中提取。
+
+    Args:
+        body: Slack interaction payload
+
+    Returns:
+        thread_ts 字符串，或 None
+    """
+    message = body.get("message", {})
+    return message.get("thread_ts") or message.get("ts")
+
+
+# ══════════════════════════════════════════════════════════
+#  Auto 命令流程（原有逻辑，完全不变）
+# ══════════════════════════════════════════════════════════
+
+def _handle_auto_command(cmd, channel: str, user: str, say, client):
+    """处理 auto 指令 — 与原有逻辑完全一致
+
+    Args:
+        cmd:     AutoCommand 数据类 (action, count, times)
+        channel: 频道 ID
+        user:    用户 ID
+        say:     Slack say 函数
+        client:  Slack WebClient
+    """
     merchant_cfg = get_merchant_by_channel(channel)
     if not merchant_cfg:
         say(":warning: This channel is not linked to any merchant. Please check merchant configuration.")
@@ -114,22 +465,18 @@ def handle_message(event: dict, say, client) -> None:
     log.info("[%s] 收到指令: %s (channel=%s, user=%s)", merchant_id, cmd.action, channel, user)
 
     # ── 立即生成 ──────────────────────────────────────────
-    # “auto n”，立刻generate n篇blog
     if cmd.action == "generate":
         count = cmd.count
 
-        # 发送初始进度消息（后续会 chat_update 更新这条消息）
         init_resp = client.chat_postMessage(
             channel=channel,
             text=f"Generating {count} blog post(s) for {store_name}...",
             blocks=build_generating_message(store_name, count),
         )
-        progress_ts = init_resp["ts"]  # 消息 timestamp，用于后续更新
+        progress_ts = init_resp["ts"]
 
-        # 在后台线程中执行（避免阻塞 Slack 事件循环）
         def _do_generate():
             try:
-                # 进度回调 — 更新同一条 Slack 消息
                 def _on_progress(stage, extra="", post_index=1, post_total=count):
                     try:
                         blocks = build_progress_blocks(
@@ -144,16 +491,14 @@ def handle_message(event: dict, say, client) -> None:
                             blocks=blocks,
                         )
                     except Exception:
-                        pass  # 更新失败不阻断
+                        pass
 
-                # auto N 手动模式：只生成预览，不自动发布到 WordPress
                 results = generate_multiple_blogs(
                     merchant_id, merchant_cfg, count,
                     progress_cb=_on_progress,
                     auto_publish=False,
                 )
 
-                # 生成完成 — 更新进度消息为 "完成"
                 try:
                     done_blocks = build_progress_blocks(
                         store_name, "done",
@@ -167,7 +512,6 @@ def handle_message(event: dict, say, client) -> None:
                 except Exception:
                     pass
 
-                # 发送结果摘要（新消息）
                 blocks = build_batch_summary_blocks(results, store_name)
                 client.chat_postMessage(
                     channel=channel,
@@ -186,7 +530,6 @@ def handle_message(event: dict, say, client) -> None:
         thread.start()
 
     # ── 开启定时调度 ──────────────────────────────────────
-    # auto on，times是选择的自动post的时间点
     elif cmd.action == "schedule_on":
         times = scheduler.schedule_on(merchant_id, channel, cmd.times or None)
         times_str = ", ".join(times)
@@ -213,6 +556,10 @@ def handle_message(event: dict, say, client) -> None:
         say(text=f"Schedule status for {store_name}", blocks=blocks)
 
 
+# ══════════════════════════════════════════════════════════
+#  Publish 指令 + 按钮（原有逻辑，完全不变）
+# ══════════════════════════════════════════════════════════
+
 def _handle_publish(text: str, channel: str, say, client) -> None:
     """处理 publish 指令 — 手动发布最近一篇草稿到 WordPress
 
@@ -222,7 +569,6 @@ def _handle_publish(text: str, channel: str, say, client) -> None:
     用法：
         @Bot publish        → 发布最近一篇草稿
     """
-    # 查找频道对应的商家
     merchant_cfg = get_merchant_by_channel(channel)
     if not merchant_cfg:
         say(":warning: This channel is not linked to any merchant.")
@@ -232,12 +578,10 @@ def _handle_publish(text: str, channel: str, say, client) -> None:
     store_name = merchant_cfg.get("store_name", merchant_id)
     wp_url = merchant_cfg.get("wordpress_url", "")
 
-    # 检查是否配置了 WordPress
     if not wp_url:
         say(f":warning: *{store_name}* has no WordPress URL configured in merchant.json.")
         return
 
-    # 获取最近的草稿
     drafts = get_drafts(merchant_id, limit=1)
     if not drafts:
         say(f":warning: No drafts found for *{store_name}*. Generate a blog first with `@bot auto 1`.")
@@ -251,7 +595,6 @@ def _handle_publish(text: str, channel: str, say, client) -> None:
     try:
         publisher = WordPressPublisher(merchant_id, merchant_cfg)
 
-        # 从草稿数据构建 blog_data
         blog_data = {
             "title": draft_title,
             "content_html": draft.get("content_html", ""),
@@ -261,7 +604,6 @@ def _handle_publish(text: str, channel: str, say, client) -> None:
             "image_alts": draft.get("image_alts", {}),
         }
 
-        # 从草稿记录读取图片路径
         image_paths = {}
         saved_paths = draft.get("image_paths", {})
         for slot, path_str in saved_paths.items():
@@ -302,23 +644,21 @@ def _handle_publish(text: str, channel: str, say, client) -> None:
         say(f":x: *Publish error:* {exc}")
 
 
-# ── Publish 按钮点击处理 ─────────────────────────────────
-
 @app.action(re.compile(r"^wp_publish_"))
 def handle_publish_button(ack, body, client) -> None:
     """处理 Slack 中 Publish 按钮的点击事件
 
     按钮的 action_id 格式: wp_publish_{session_id}
     通过 session_id 找到对应的草稿，发布到 WordPress。
+    同时服务 Auto 流程和 Chat 流程的 Publish 按钮。
     """
-    ack()  # 必须在 3 秒内确认收到
+    ack()
 
     action_id = body["actions"][0]["action_id"]
     session_id = action_id.replace("wp_publish_", "")
     channel = body["channel"]["id"]
     user = body["user"]["id"]
 
-    # 查找频道对应的商家
     merchant_cfg = get_merchant_by_channel(channel)
     if not merchant_cfg:
         client.chat_postMessage(channel=channel, text=":warning: This channel is not linked to any merchant.")
@@ -327,7 +667,6 @@ def handle_publish_button(ack, body, client) -> None:
     merchant_id = merchant_cfg["merchant_id"]
     store_name = merchant_cfg.get("store_name", merchant_id)
 
-    # 从草稿中找到对应 session_id 的记录
     all_drafts = get_drafts(merchant_id, limit=50)
     draft = None
     for d in all_drafts:
@@ -341,9 +680,17 @@ def handle_publish_button(ack, body, client) -> None:
 
     draft_title = draft.get("title", "Untitled")
 
-    # 发一条新消息表示开始发布（每篇独立，不会互相覆盖）
+    # 发布消息（可能在 thread 内也可能不在）
+    # 如果是 Chat 流程的 Publish，发布成功后标记会话为 DONE
+    thread_ts = body.get("message", {}).get("thread_ts")
+    if thread_ts:
+        sess = chat_session.get(thread_ts)
+        if sess:
+            chat_session.update_stage(thread_ts, DONE)
+
     progress_resp = client.chat_postMessage(
         channel=channel,
+        thread_ts=thread_ts,
         text=f":hourglass_flowing_sand: Publishing *{draft_title}* to WordPress...",
     )
     progress_ts = progress_resp["ts"]
@@ -363,7 +710,6 @@ def handle_publish_button(ack, body, client) -> None:
             "image_alts": draft.get("image_alts", {}),
         }
 
-        # 从草稿记录读取图片路径（不再用时间戳猜测）
         image_paths = {}
         saved_paths = draft.get("image_paths", {})
         for slot, path_str in saved_paths.items():
@@ -397,7 +743,6 @@ def handle_publish_button(ack, body, client) -> None:
                 f":link: *Post:* <{post_url}|View on WordPress>\n"
                 f":pencil2: *Edit:* <{edit_url}|Open in WP Admin>"
             )
-            # 更新自己的进度消息为成功信息
             client.chat_update(
                 channel=channel, ts=progress_ts,
                 text=f"Published: {draft_title}",
@@ -419,12 +764,36 @@ def handle_publish_button(ack, body, client) -> None:
 
 
 @app.event("app_mention")
-def handle_mention(event: dict, say) -> None:
-    """app_mention 事件 — 已在 message 事件中统一处理，此处留空防止 Slack 报错"""
-    pass
+def handle_mention(event: dict, say, client) -> None:
+    """app_mention 事件 — 仅处理 message 事件遗漏的情况
+
+    Slack 对 @mention 消息会同时触发 message + app_mention 两个事件。
+    message handler 已经处理了大部分情况，这里只在 message 事件未处理时补充。
+    用 _processed_events 去重，避免同一条消息处理两遍。
+    """
+    ts = event.get("ts", "")
+    if ts in _processed_events:
+        return  # message 事件已经处理过了
+    log.info("app_mention 补充处理: user=%s thread_ts=%s ts=%s",
+             event.get("user"), event.get("thread_ts"), ts)
+    handle_message(event, say, client)
 
 
-# ── 启动 ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+#  工具函数
+# ══════════════════════════════════════════════════════════
+
+def _safe_run(func, *args):
+    """安全运行函数 — 捕获异常并记录日志，防止后台线程崩溃"""
+    try:
+        func(*args)
+    except Exception:
+        log.exception("后台线程执行出错: %s", func.__name__)
+
+
+# ══════════════════════════════════════════════════════════
+#  启动
+# ══════════════════════════════════════════════════════════
 
 def main() -> None:
     """主启动函数"""
@@ -443,10 +812,7 @@ def main() -> None:
         log.error("缺少 OPENAI_API_KEY")
         sys.exit(1)
 
-    # 2. 加载所有商家配置和 Agent 人格，会完成一下配置
-    # _channel_map 所有频道 ID → 商家配置(merchant.json+scrape_targets.yaml)的映射
-    # _merchant_map：所有商家 ID → 商家配置(merchant.json+scrape_targets.yaml)的映射
-    # _soul_store：# 所有商家人格存储: {merchant_id: {"_shared": "内容", "researcher": "内容", ...}}
+    # 2. 加载所有商家配置和 Agent 人格
     log.info("Step 1: 加载商家配置...")
     load_all_merchants()
 
@@ -457,21 +823,17 @@ def main() -> None:
     log.info("Bot user_id: %s", _bot_user_id)
 
     # 4. 启动预览服务器
-    # 让每篇blog可以有localhost的网页浏览链接
     log.info("Step 3: 启动预览服务器...")
     start_preview_server()
 
     # 5. 启动定时调度器
-    # 把slack bot的webclient传给scheduler初始化
-    # 后台开启美西钟表
     log.info("Step 4: 启动定时调度器...")
     scheduler.init(app.client)
 
     # 6. 启动 Slack Socket Mode
-    # 开始监听@app.event("message")和@app.event("app_mention")
     log.info("Step 5: 启动 Slack Socket Mode...")
     log.info("=" * 60)
-    log.info("Bot is ready! Listening for 'auto' commands in merchant channels.")
+    log.info("Bot is ready! Listening for commands and chat in merchant channels.")
     log.info("=" * 60)
 
     handler = SocketModeHandler(app, cfg.SLACK_APP_TOKEN)
