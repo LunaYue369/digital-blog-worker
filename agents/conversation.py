@@ -351,7 +351,7 @@ def chat_and_maybe_generate(sess: dict, user_text: str, say, client, merchant_id
             model=MODEL,
             messages=messages,
             temperature=0.4,
-            max_tokens=800,
+            max_tokens=2000,
             response_format={"type": "json_object"},
         )
     except Exception as e:
