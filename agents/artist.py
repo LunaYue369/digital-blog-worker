@@ -50,6 +50,16 @@ def enhance_image_prompts(
     system_prompt = build_system_prompt(merchant_id, "artist")
     client = _get_client()
 
+    # 动态构建 prompt 列表（兼容 hero/mid/end 和 img_1/img_2/.../img_N）
+    prompt_lines = []
+    for slot, prompt in image_prompts.items():
+        label = {"hero": "Hero (banner)", "mid": "Mid-article", "end": "End-article (CTA)"}.get(slot, f"Image {slot}")
+        prompt_lines.append(f"- **{label}:** {prompt or 'No prompt provided'}")
+    prompts_text = "\n                    ".join(prompt_lines)
+
+    # 动态构建期望的输出 key
+    output_keys = ", ".join(f'"{k}": "Enhanced prompt..."' for k in image_prompts.keys())
+
     user_prompt = f"""Enhance the following image prompts for a professional business blog.
 
                     ## Blog Context
@@ -57,26 +67,20 @@ def enhance_image_prompts(
                     - **Summary:** {blog_excerpt}
 
                     ## Original Image Prompts (from copywriter)
-                    - **Hero (banner):** {image_prompts.get('hero', 'No prompt provided')}
-                    - **Mid-article:** {image_prompts.get('mid', 'No prompt provided')}
-                    - **End-article (CTA):** {image_prompts.get('end', 'No prompt provided')}
+                    {prompts_text}
 
                     ## Enhancement Requirements
                     1. Each prompt should be 80-150 words, highly detailed
                     2. Style: Professional, high-end, corporate-quality photography or 3D rendering
                     3. Include specific details: lighting, composition, color palette, perspective, texture
                     4. NO text, logos, watermarks, or brand names in the image
-                    5. Hero image should be the most visually striking — wide composition (16:9 friendly)
-                    6. Mid image should illustrate a specific concept from the article
-                    7. End image should evoke trust and professionalism (supports CTA)
+                    5. The first image should be the most visually striking — wide composition (16:9 friendly)
+                    6. Middle images should illustrate specific concepts from the article
+                    7. The last image should evoke trust and professionalism (supports CTA)
 
                     ## Output Format (JSON)
-                    Return ONLY valid JSON:
-                    {{
-                        "hero": "Enhanced Seedream prompt for hero banner image...",
-                        "mid": "Enhanced Seedream prompt for mid-article image...",
-                        "end": "Enhanced Seedream prompt for end CTA image..."
-                    }}"""
+                    Return ONLY valid JSON with these exact keys:
+                    {{{output_keys}}}"""
 
     resp = client.chat.completions.create(
         model=MODEL,
@@ -99,10 +103,7 @@ def enhance_image_prompts(
         log.error("[%s] Artist JSON 解析失败", merchant_id)
         enhanced = image_prompts  # 失败时回退到原始 prompt
 
-    log.info("[%s] Artist 美化完成: hero=%d字, mid=%d字, end=%d字",
-             merchant_id,
-             len(enhanced.get("hero", "")),
-             len(enhanced.get("mid", "")),
-             len(enhanced.get("end", "")))
+    slot_lengths = ", ".join(f"{k}={len(v)}字" for k, v in enhanced.items())
+    log.info("[%s] Artist 美化完成: %s", merchant_id, slot_lengths)
 
     return enhanced, usage

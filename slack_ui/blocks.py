@@ -307,7 +307,56 @@ def build_generating_message(merchant_name: str, count: int) -> list[dict]:
     ]
 
 
-# ── 进度阶段定义 ───────────────────────────────────────────
+# ── Chat 模式进度阶段 ──────────────────────────────────────
+CHAT_PROGRESS_STAGES = [
+    {"key": "template",  "emoji": ":art:",                   "label": "Selecting template & layout"},
+    {"key": "web",       "emoji": ":globe_with_meridians:",  "label": "Researching competitor articles"},
+    {"key": "write",     "emoji": ":pencil:",                "label": "Writing blog content"},
+    {"key": "review",    "emoji": ":eyes:",                  "label": "Reviewing content quality"},
+    {"key": "rewrite",   "emoji": ":memo:",                  "label": "Revising based on feedback"},
+    {"key": "image",     "emoji": ":camera:",                "label": "Processing images"},
+    {"key": "render",    "emoji": ":package:",               "label": "Assembling final preview"},
+    {"key": "done",      "emoji": ":white_check_mark:",      "label": "Complete!"},
+]
+
+_CHAT_STAGE_INDEX = {s["key"]: i for i, s in enumerate(CHAT_PROGRESS_STAGES)}
+
+
+def build_chat_progress_blocks(
+    store_name: str,
+    current_stage: str,
+    extra_info: str = "",
+) -> list[dict]:
+    """构建 Chat 模式的实时进度消息（单条消息动态更新）"""
+    current_idx = _CHAT_STAGE_INDEX.get(current_stage, 0)
+
+    lines = []
+    for i, stage in enumerate(CHAT_PROGRESS_STAGES):
+        if stage["key"] == "rewrite" and current_stage != "rewrite":
+            continue
+
+        if i < current_idx:
+            lines.append(f":white_check_mark:  {stage['label']}")
+        elif i == current_idx:
+            lines.append(f"{stage['emoji']}  *{stage['label']}...*")
+        else:
+            lines.append(f":white_circle:  {stage['label']}")
+
+    progress_text = "\n".join(lines)
+    extra_line = f"\n\n:bulb: _{extra_info}_" if extra_info else ""
+
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":rocket: *Generating blog for {store_name}*\n\n{progress_text}{extra_line}",
+            },
+        },
+    ]
+
+
+# ── Auto 模式进度阶段 ─────────────────────────────────────
 PROGRESS_STAGES = [
     {"key": "scrape",    "emoji": ":mag:",                   "label": "Scraping trending keywords"},
     {"key": "research",  "emoji": ":brain:",                 "label": "Analyzing SEO opportunities"},
@@ -379,3 +428,193 @@ def build_progress_blocks(
             },
         },
     ]
+
+
+# ── Chat 对话模式专用消息构建 ────────────────────────────────
+
+
+def build_chat_result_blocks(result: dict) -> list[dict]:
+    """构建 Chat 对话模式的博客生成结果消息
+
+    与 auto 模式的 build_blog_result_blocks 类似，但增加了:
+    - Publish + Regenerate 按钮（在 thread 内交互）
+    - 不显示批量编号（chat 一次只生成一篇）
+    - 用户也可以直接在 thread 里打字提修改意见
+
+    Args:
+        result: pipeline 返回的结果字典
+                示例: {
+                    "success": True,
+                    "title": "Ultimate Guide to Tesla PPF",
+                    "preview_url": "http://localhost:8900/thouseirvine/xxx.html",
+                    "blog_data": {"title": "...", "excerpt": "...", "tags": [...], ...},
+                    "review_score": 88,
+                    "review_rounds": 2,
+                    "session_id": "chat_thouseirvine_1712100000_abc123",
+                    "usage_report": "...",
+                    "generation_time": "45s",
+                    "template_name": "Classic White",
+                    "layout_label": "How-To Guide",
+                }
+
+    Returns:
+        Slack Block Kit blocks 列表，包含:
+        - 标题 + 摘要
+        - SEO 信息
+        - 审核评分 + 模板/布局
+        - 预览链接
+        - Publish + Regenerate 按钮
+
+    输出示例（渲染效果）:
+        ┌─────────────────────────────────────────┐
+        │ 📓 Blog Generated via Chat               │
+        │                                          │
+        │ **Ultimate Guide to Tesla PPF**          │
+        │ _Protect your Tesla with XPEL PPF..._    │
+        │                                          │
+        │ ✅ Review: 88/100 (round 2)              │
+        │ 🏷️ Tags: PPF  Tesla  PaintProtection     │
+        │ 🎨 Template: Classic White               │
+        │ ⏱️ Time: 45s                             │
+        │                                          │
+        │ 👀 [Open Preview in Browser]             │
+        │                                          │
+        │ [📤 Publish to WordPress] [🔄 Regenerate] │
+        └─────────────────────────────────────────┘
+    """
+    if not result.get("success"):
+        return [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f":x: *Blog Generation Failed*\n\n"
+                            f"Error: {result.get('error', 'Unknown error')}",
+                },
+            },
+        ]
+
+    title = result.get("title", "Untitled")
+    preview_url = result.get("preview_url", "")
+    score = result.get("review_score", 0)
+    rounds = result.get("review_rounds", 0)
+    usage = result.get("usage_report", "")
+    blog_data = result.get("blog_data", {})
+    excerpt = blog_data.get("excerpt", "")
+    tags = blog_data.get("tags", [])
+    template_name = result.get("template_name", "N/A")
+    layout_label = result.get("layout_label", "N/A")
+    gen_time = result.get("generation_time", "N/A")
+    session_id = result.get("session_id", "")
+
+    tags_text = "  ".join(f"`{t}`" for t in tags[:5]) if tags else "N/A"
+
+    if score >= 90:
+        score_emoji = ":star2:"
+    elif score >= 80:
+        score_emoji = ":white_check_mark:"
+    else:
+        score_emoji = ":warning:"
+
+    # 图片数量
+    image_count = len(result.get("image_paths", {}))
+
+    # 评分条（视觉化）
+    filled = round(score / 10)
+    bar = ":large_green_square:" * filled + ":white_large_square:" * (10 - filled)
+
+    blocks = [
+        # ── 标题 ──
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": ":sparkles: Blog Ready for Review",
+            },
+        },
+        # ── 博客标题 + 摘要 ──
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":memo: *{title}*\n\n_{excerpt}_",
+            },
+        },
+        {"type": "divider"},
+        # ── 审核评分 ──
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"{score_emoji} *Review Score:*  *{score}/100*  ({rounds} round{'s' if rounds > 1 else ''})\n"
+                    f"{bar}"
+                ),
+            },
+        },
+        # ── 内容详情 ──
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f":label: *Tags:*  {tags_text}\n"
+                    f":frame_with_picture: *Images:*  {image_count} image{'s' if image_count > 1 else ''}\n"
+                    f":art: *Template:*  {template_name}  |  :page_facing_up: *Layout:*  {layout_label}\n"
+                    f":stopwatch: *Time:*  {gen_time}"
+                ),
+            },
+        },
+        {"type": "divider"},
+        # ── 预览链接 ──
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":eyes:  *<{preview_url}|Open Preview in Browser>*",
+            },
+        },
+        # ── 提示 ──
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": ":speech_balloon: _Reply in this thread to request changes, or use the buttons below._",
+                },
+            ],
+        },
+    ]
+
+    # ── 操作按钮 ──
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": ":outbox_tray: Publish to WordPress"},
+                "style": "primary",
+                "action_id": f"wp_publish_{session_id}",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": ":arrows_counterclockwise: Regenerate"},
+                "action_id": f"chat_regenerate_{session_id}",
+            },
+        ],
+    })
+
+    # ── 用量信息 ──
+    if usage:
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f":bar_chart: *Cost:*  {usage}",
+                },
+            ],
+        })
+
+    return blocks

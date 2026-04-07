@@ -205,29 +205,29 @@ class WordPressPublisher:
                        title: str = "", image_alts: dict[str, str] | None = None) -> str:
         """将 WP 媒体库图片 URL 插入文章内容
 
-        Copywriter 输出的 content_html 含 <!-- BLOG_IMAGE:hero/mid/end --> 占位符。
-        替换为带 WP 图片 URL 的 <img> 标签。兼容已嵌入 base64 的旧路径。
+        兼容两种占位符格式：
+        - Auto 模式: <!-- BLOG_IMAGE:hero/mid/end -->
+        - Chat 模式: <!-- BLOG_IMAGE:img_1/img_2/.../img_N -->
+        替换为带 WP 图片 URL 的 <img> 标签。
         """
-        slot_class_map = {
-            "hero": "hero-inline",
-            "mid": "mid-image",
-            "end": "end-image",
-        }
-        # 优先用 Copywriter 提供的 SEO alt text
-        slot_alt_map = {
-            "hero": (image_alts or {}).get("hero", title or "Blog post image"),
-            "mid": (image_alts or {}).get("mid", f"{title} - detail"),
-            "end": (image_alts or {}).get("end", f"{title} - service"),
-        }
+        alts = image_alts or {}
 
         inserted_count = 0
         for slot, wp_url in image_url_map.items():
             if not wp_url:
                 continue
 
-            css_class = slot_class_map.get(slot, "")
-            alt_text = slot_alt_map.get(slot, "")
-            loading = "eager" if slot == "hero" else "lazy"
+            # 动态生成 CSS class: hero → hero-inline, img_1 → img_1-image
+            if slot in ("hero", "mid", "end"):
+                css_class = {"hero": "hero-inline", "mid": "mid-image", "end": "end-image"}[slot]
+            else:
+                css_class = f"{slot}-image"
+
+            # 优先用 Copywriter 提供的 SEO alt text，fallback 用标题
+            alt_text = alts.get(slot, f"{title} - {slot}" if title else "Blog post image")
+
+            # 第一张图 eager loading（hero 或 img_1）
+            loading = "eager" if slot in ("hero", "img_1") else "lazy"
 
             # 方式 1：替换 <!-- BLOG_IMAGE:slot --> 注释占位符（主要路径）
             placeholder = f"<!-- BLOG_IMAGE:{slot} -->"
@@ -271,9 +271,9 @@ class WordPressPublisher:
                     if slot_idx < len(slots):
                         slot = slots[slot_idx]
                         wp_url = image_url_map[slot]
-                        css_class = slot_class_map.get(slot, "")
-                        alt_text = slot_alt_map.get(slot, "")
-                        loading = "eager" if slot == "hero" else "lazy"
+                        css_class = f"{slot}-image" if slot not in ("hero", "mid", "end") else {"hero": "hero-inline", "mid": "mid-image", "end": "end-image"}[slot]
+                        alt_text = alts.get(slot, f"{title} - {slot}" if title else "Blog post image")
+                        loading = "eager" if slot in ("hero", "img_1") else "lazy"
                         replacement = (
                             f'<div class="blog-image {css_class}">'
                             f'<img src="{wp_url}" alt="{alt_text}" loading="{loading}">'
@@ -335,8 +335,7 @@ class WordPressPublisher:
         uploaded_images = {}   # {slot: {"id": int, "url": str}}
         image_url_map = {}     # {slot: url} — 用于替换 content 中的 base64
 
-        for slot in ["hero", "mid", "end"]:
-            img_path = image_paths.get(slot)
+        for slot, img_path in image_paths.items():
             if not img_path:
                 continue
 
@@ -350,7 +349,7 @@ class WordPressPublisher:
             else:
                 log.warning("[%s] %s 图片上传失败，跳过", self.merchant_id, slot)
 
-        log.info("[%s] 图片上传完成: %d/3 成功", self.merchant_id, len(uploaded_images))
+        log.info("[%s] 图片上传完成: %d/%d 成功", self.merchant_id, len(uploaded_images), len(image_paths))
 
         # ── Step 2: 将 WP 图片 URL 插入 content 占位符 ─────
         if image_url_map:
@@ -394,10 +393,10 @@ class WordPressPublisher:
             "ping_status": "open",      # 允许 pingback
         }
 
-        # 设置 featured image（特色图片）— 用 hero 图
-        hero_media = uploaded_images.get("hero")
-        if hero_media:
-            post_data["featured_media"] = hero_media["id"]
+        # 设置 featured image（特色图片）— 用第一张图（auto 模式是 hero，chat 模式是 img_1）
+        first_slot = next(iter(uploaded_images), None)
+        if first_slot:
+            post_data["featured_media"] = uploaded_images[first_slot]["id"]
 
         try:
             resp = requests.post(
@@ -432,8 +431,7 @@ class WordPressPublisher:
 
             # 收集已上传图片的文件名（slot → filename）
             image_names = {}
-            for slot in ["hero", "mid", "end"]:
-                img_path = image_paths.get(slot)
+            for slot, img_path in image_paths.items():
                 if img_path and slot in uploaded_images:
                     image_names[slot] = Path(img_path).name if hasattr(img_path, 'name') else str(img_path).split("/")[-1].split("\\")[-1]
 
